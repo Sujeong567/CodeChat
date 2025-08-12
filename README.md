@@ -1,6 +1,6 @@
-# poppop-PLL-FHE: Secure Inference with LoRA & Homomorphic Encryption
+# LoRA-AutoFix: Secure Inference with LoRA & Homomorphic Encryption
 
-본 프로젝트는 **Java + Spring** 기반의 팀 프로젝트 poppop의 구조를 참고해, 첨부 논문 "Practical Secure Inference Algorithm for Fine-tuned Large Language Model Based on Fully Homomorphic Encryption"을 실습 목표로 합니다. **VSCode** 환경을 기본으로 하며, LoRA 기반 모델 파인튜닝 후 Fully Homomorphic Encryption(FHE)를 적용한 Private Linear Layer(PLL)로 안전한 추론 시스템을 구현합니다.
+첨부 논문 "Practical Secure Inference Algorithm for Fine-tuned Large Language Model Based on Fully Homomorphic Encryption"을 실습 목표로 합니다. **VSCode** 환경을 기본으로 하며, LoRA 기반 모델 파인튜닝 후 Fully Homomorphic Encryption(FHE)를 적용한 Private Linear Layer(PLL)로 안전한 추론 시스템을 구현합니다.
 
 ***
 
