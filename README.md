@@ -7,16 +7,39 @@
 ## 🗂️ 프로젝트 구조 및 역할
 
 ```
-poppop-PLL-FHE/
-├── controller/   # HTTP/API, REST UI 요청 처리 및 service 연결
-├── service/      # 로직 구현, 모델 추론·암호화 연동
-├── repository/   # 데이터베이스 및 외부 저장 접근 (로그·모델 등)
-├── domain/       # Entity 클래스 (데이터/모델 구조 정의)
-├── resources/    # UI, 정적 파일, 샘플 config 등
-├── fhe/          # 동형암호(FHE) 연동, CKKS/SEAL 바인딩 모듈
-├── lora/         # LoRA 관련 코드 및 fine-tuning 스크립트
-├── scripts/      # 파이썬 등 추론/암호화 보조 스크립트
-└── README.md     # 본 문서
+/LoRA-AutoFix
+│
+├── /data                       # 학습 데이터 및 변환 페어 저장
+│   ├── before/                 # 변환 전 코드 샘플 저장소
+│   ├── after/                  # 변환 후 코드 샘플 저장소
+│   └── pairs.json              # "Before → After" 페어 매핑 파일 (JSON, CSV 등)
+│
+├── /autofix                    # 규칙 기반 자동 변환 스크립트 및 도구
+│   ├── generate_pairs.py       # 오픈소스 코드 + 사내 규칙 적용하여 페어 생성 스크립트
+│   ├── rules/                  # 변환 규칙 스크립트 (ex. Semgrep 룰, AST 변환 모듈)
+│   └── utils.py                # 코드 파싱/분석/수정 헬퍼 함수들
+│
+├── /model                      # Code Llama 모델 관리 및 LoRA 미세조정 관련 코드
+│   ├── train_LoRA.py           # LoRA 미세조정 학습 스크립트
+│   ├── infer_prompt.py         # 프롬프트 기반 테스트 코드 (1단계 테스트용)
+│   ├── config.py               # 학습 및 추론 설정
+│   └── utils.py                # 모델 입출력 전처리 및 후처리
+│
+├── /deployment                 # 내부 서버용 Code Llama 배포 및 실행 관련 파일
+│   ├── serve_model.py          # 내부 서버에서 모델 실행용 스크립트
+│   ├── requirements.txt        # 배포 환경 종속성
+│   └── README.md               # 배포/운영 가이드
+│
+├── /tests                      # 단위 테스트 및 통합 테스트
+│   ├── test_generate_pairs.py  # 변환 페어 생성 테스트
+│   ├── test_rules.py           # 규칙 스크립트 테스트
+│   ├── test_lora_training.py   # LoRA 학습 테스트
+│   └── test_infer_prompt.py    # 프롬프트 테스트
+│
+├── README.md                   # 프로젝트 개요, 설치 및 실행 방법, 개발 가이드
+├── LICENSE                    # 라이선스 파일
+└── .gitignore                  # Git 무시 설정
+
 ```
 
 ***
