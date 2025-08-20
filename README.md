@@ -60,7 +60,8 @@
 
 - **VSCode** (권장: Remote-WSL, Dev Containers)
 - Python 3.10+ (모델, FHE 연동)
-- tenSEAL 
+- tenSEAL
+- Huggingface Transformers 라이브러리 (테스트용 LoRA: `bert-tiny`)  
 
 ***
 
