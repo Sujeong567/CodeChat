@@ -45,3 +45,6 @@ labels = [
     1,  # 함수 greet 정상
     0   # Exception 강제 발생
 ]
+
+def load_data():
+    return pythontexts, labels
