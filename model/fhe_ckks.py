@@ -1,3 +1,4 @@
+#CKKS 래핑, 암호화/복호화 함수 
 import tenseal as ts
 import base64
 import requests
