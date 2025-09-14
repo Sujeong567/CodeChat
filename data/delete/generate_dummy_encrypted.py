@@ -1,4 +1,7 @@
 # Dummy 암호화 데이터 생성
+import json
+import os
+
 pythontexts = [
     "print('Hello, world!')",
     "for i in range(5):\n    print(i)",
@@ -46,5 +49,9 @@ labels = [
     0   # Exception 강제 발생
 ]
 
-def load_data():
-    return pythontexts, labels
+dataset = [{"code": code, "label": label} for code, label in zip(pythontexts, labels)]
+
+os.makedirs("CodeChat/data/raw", exist_ok=True)
+
+with open("CodeChat/data/raw/dummy_dataset.json", "w", encoding="utf-8") as f:
+    json.dump(dataset, f, ensure_ascii=False, indent=2)
