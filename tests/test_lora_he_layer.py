@@ -1,23 +1,20 @@
-# tests/test_lora_he_layer.py
+import os
 import numpy as np
 import tenseal as ts
-# model.lora_he_layer에서 테스트할 함수를 임포트합니다.
 from model.lora_he_layer import encrypt_lora_input
-# Context를 생성하기 위해 model.fhe_ckks_local에서 create_context를 임포트합니다.
 from model.fhe_ckks_local import create_context
+
+# 프로젝트 루트 디렉터리
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+LOCA_INPUT_PATH = os.path.join(PROJECT_ROOT, "data", "processed", "lora_zero_input.npy")
 
 def test_lora_encryption_function_only():
     print("\n--- encrypt_lora_input 함수 단독 테스트 시작 ---")
 
-    # ***** 중요: model/fhe_ckks_local.py의 create_context 함수에서 *****
-    # ***** context.make_context_public() 줄을 반드시 주석 처리하거나 제거해야 *****
-    # ***** 비밀키가 유지되어 복호화 테스트를 진행할 수 있습니다.             *****
-    # *************************************************************************
-
     try:
-        test_input_vector = np.load("data/processed/lora_zero_input.npy")
+        test_input_vector = np.load(LOCA_INPUT_PATH)
     except FileNotFoundError:
-        print("오류: 'data/processed/lora_zero_input.npy' 파일을 찾을 수 없습니다.")
+        print(f"오류: '{LOCA_INPUT_PATH}' 파일을 찾을 수 없습니다.")
         print("테스트를 실행하기 전에 'preprocess_lora_zero_input.py' 스크립트를 먼저 실행하여")
         print("해당 파일을 생성해주세요.")
         return
@@ -68,3 +65,4 @@ def test_lora_encryption_function_only():
 
 if __name__ == "__main__":
     test_lora_encryption_function_only()
+    
