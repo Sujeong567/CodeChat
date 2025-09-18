@@ -1,7 +1,6 @@
 import numpy as np
-
-from .generate_zero_matrix import generate_zero_matrix
 from .generate_random_matrix import generate_random_matrix
+from .generate_zero_matrix import generate_zero_matrix
 
 
 def generate_lora_low_rank_matrices(d, r, std=0.02):
@@ -11,8 +10,8 @@ def generate_lora_low_rank_matrices(d, r, std=0.02):
     r: rank(저랭크 차원)
     std: A행렬 표준편차 (default 0.02)
     """
-    A = generate_random_matrix(r, d, std)  
-    B = generate_zero_matrix(d, r, dtype=np.float32)
+    A = generate_random_matrix(d, r, std)  
+    B = generate_zero_matrix(r, d, dtype=np.float32)
    
     return A, B
 
