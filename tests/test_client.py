@@ -13,7 +13,13 @@ from deployment.client import Client
 RAW_FILE = "data/raw/dummy_code_snippets.json"
 EMBEDDING_FILE = "data/embedding/dummy_code_after_embedding.npy"
 
-def test_client_pipeline():
+def recall_at_k(true_idx, pred_indicies, k=5):
+    """Recall@k 계산"""
+    if true_idx is None:
+        return None
+    return int(true_idx in pred_indicies) / 1.0
+
+def test_client_pipeline(k=5):
 
     # 원본 임베딩 로드
     original_embeddings = np.load(EMBEDDING_FILE)
@@ -27,19 +33,22 @@ def test_client_pipeline():
 
     print(f"Loaded {len(data)} snippets from '{RAW_FILE}'")
 
+    recalls_pre, recalls_post = [], []
+
     # 각 스니펫 처리
     for idx, snippet in enumerate(data, start=1):
-        text = snippet.get("text", "")  # JSON 구조에 맞춰 key 수정 가능
+        text = snippet.get("text", "")
         if not text:
             continue
 
-        # 임베딩
-        try:
-            emb = client.embed_text(text)
-            print(f"Embedding done (first 5 values): {[round(x,6) for x in emb[:5]]}")
-        except Exception as e:
-            print(f"Embedding error: {e}")
-            continue
+        # HE 적용 전 Top-k
+        emb = client.embed_text(text)
+        topk_idx_pre, _ = client.topk_search(emb, original_embeddings, k=k)
+        
+        true_idx = idx - 1
+
+        recall_pre = recall_at_k(true_idx, topk_idx_pre, k)
+        recalls_pre.append(recall_pre)
 
         # CKKS 암호화
         enc_vec = client.encrypt_embedding(emb)
@@ -55,14 +64,21 @@ def test_client_pipeline():
             # 복호화
             dec_vec = client.decrypt_embedding(result_vec)
 
-            # 근사 임베딩 찾기
-            approx_vec, approx_idx = client.approximate_token_embedding(dec_vec, original_embeddings)
+            # HE 적용 후 Top-k
+            topk_idx_post, _ = client.topk_search(dec_vec, original_embeddings, k=k)
+            recall_post = recall_at_k(true_idx, topk_idx_post, k)
+            recalls_post.append(recall_post)
 
-            # 원본 인덱스와 비교
-            print(f"[{idx}/{len(data)}] Original snippet: {text[:30]}...")
-            print(f"Closest embedding index: {approx_idx}, first 5 values: {[round(x,6) for x in approx_vec[:5]]}")
+            print(f"[{idx}/{len(data)}] Query: {text[:30]}...")
+            print(f"HE 전 Top-{k}: {topk_idx_pre}, Recall@{k}: {recall_pre}")
+            print(f"HE 후 Top-{k}: {topk_idx_post}, Recall@{k}: {recall_post}")
+            print("-"*60)
+    
         except Exception as e:
             print(f"[{idx}/{len(data)}] Error handling response: {e}")
-
+    
+    print(f"Average Recall@{k} HE 전: {np.mean(recalls_pre):.3f}")
+    print(f"Average Recall@{k} HE 후: {np.mean(recalls_post):.3f}")
+          
 if __name__ == "__main__":
-    test_client_pipeline()
+    test_client_pipeline(k=5)

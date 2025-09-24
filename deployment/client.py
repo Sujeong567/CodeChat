@@ -1,5 +1,4 @@
 import os
-import json
 import base64
 import numpy as np
 import tenseal as ts
@@ -25,10 +24,8 @@ class Client:
         self.context = self._load_context(context_file)
         self.server_url = server_url
     
-# -------------------------
-# CKKS 컨텍스트 로드
-# -------------------------
     def _load_context(self, path):
+        """CKKS 컨텍스트 로드"""
         with open(path, "rb") as f:
             ctx_bytes = f.read()
         try:
@@ -49,24 +46,17 @@ class Client:
         """CKKS 복호화 -> numpy 벡터"""
         return np.array(enc_vec.decrypt())
     
-    def approximate_token_embedding(self, decrypted_vec: np.ndarray, original_embeddings: np.ndarray):
-        """
-        복호화된 벡터 -> 원본 임베딩 중 가장 가까운 벡터 반환 (코사인 유사도로 argmax)
-        : param decrypted_vec: CKKS 복호화된 벡터
-        : param original_embeddings: 기존 데이터셋 임베딩 (np.ndarray)
-        """
+    def topk_search(self, query_vec, dataset_embeddings, k=5):
+        """코사인 유사도로 Top-k 인덱스와 유사도 반환"""
         # 정규화
-        norm_dec = decrypted_vec / (np.linalg.norm(decrypted_vec) + 1e-8)
-        norm_orig = original_embeddings / (np.linalg.norm(original_embeddings, axis=1, keepdims=True) + 1e-8)
+        norm_query = query_vec / (np.linalg.norm(query_vec) + 1e-8)
+        norm_dataset = dataset_embeddings / (np.linalg.norm(dataset_embeddings, axis=1, keepdims=True) + 1e-8)
 
         # 코사인 유사도 계산
-        similarities = norm_orig @ norm_dec
-        idx = np.argmax(similarities)
-        return original_embeddings[idx], idx
+        sims = norm_dataset @ norm_query
+        topk_idx = np.argsort(sims)[::-1][:k]
+        return topk_idx, sims[topk_idx]
     
-    # -------------------------
-    # 서버로 암호화된 벡터 전송
-    # -------------------------
     def send_to_server(self, enc_vec) -> dict:
         """
         서버로 CKKS 벡터 전송 후 결과 반환
@@ -75,7 +65,7 @@ class Client:
         """
         # enc_vec 직렬화 -> bytes -> base64 문자열
         payload = {
-            "encrypted_vector": base64.b64encode(enc_vec.serialize()).decode("utf-8") # TenSEAL 벡터 직렬화
+            "encrypted_vector": base64.b64encode(enc_vec.serialize()).decode("utf-8")
         }
 
         try:
