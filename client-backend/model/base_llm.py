@@ -22,6 +22,11 @@ class BaseLLMLoader:
         self.tokenizer = AutoTokenizer.from_pretrained(LLM_NAME, cache_dir=HF_CACHE_DIR)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        # DeepSeek Coder 템플릿 설정
+        if self.tokenizer.chat_template is None:
+            self.tokenizer.chat_template = "{% for message in messages %}{% if message['role']" \
+            "== 'user' %}### Instruction:\n{{ message['content] }}\n{% elif message['role'] == 'assistant'" \
+            "%}### Response:\n{{ message['content'] }}\n{% endif %}{% endfor %}"
         print(f"[Client-Backend][BaseLLMLoader] 토크나이저 로드 완료: {LLM_NAME}")
 
         # Base Model
@@ -34,14 +39,14 @@ class BaseLLMLoader:
             cache_dir=HF_CACHE_DIR
         ).to(DEVICE)
         self.base_model.eval() # 모델을 추론 모드로 설정
-        print(f"Base LLM 로드 완료 (4비트 양자화, {DEVICE} 사용)")
+        print(f"[Client-Backend][BaseLLMLoader] Base LLM 로드 완료 (4비트 양자화, {DEVICE} 사용)")
 
         # Model Info
         self.hidden_size = self.base_model.config.hidden_size
         self.eos_token_id = self.tokenizer.eos_token_id
 
-        print(f"LLM Hidden Size: {self.hidden_size}")
-        print(f"EOS Token ID: {self.eos_token_id}")
+        print(f"[Client-Backend][BaseLLMLoader] LLM Hidden Size: {self.hidden_size}")
+        print(f"[Client-Backend][BaseLLMLoader] EOS Token ID: {self.eos_token_id}")
 
         gc.collect()
         torch.cuda.empty_cache()
