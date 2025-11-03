@@ -14,6 +14,7 @@ def create_context():
     )
     context.global_scale = 2 ** 40
     context.generate_galois_keys()
+    context.generate_relin_keys()
     # 주의: make_context_public() 호출을 제거하여 비밀키가 컨텍스트에 유지되도록 합니다.
     # context.make_context_public()
     return context
@@ -27,12 +28,12 @@ def ckks_encrypt(input_vector, encryption_context):
     enc_vec = ts.ckks_vector(encryption_context, input_vector)
     return enc_vec
 
-def ckks_decrypt(encrypted_vector):
+def ckks_decrypt(encrypted_vector , decryption_context):
     """
     암호화된 벡터를 복호화합니다.
     복호화는 암호화 시 사용된 Context에 비밀키가 있어야만 가능합니다.
     """
-    return encrypted_vector.decrypt()
+    return encrypted_vector.decrypt(secret_key=decryption_context.secret_key())
 
 def _get_ckks_vector_length(enc_vec):
     """
@@ -64,6 +65,12 @@ def _get_ckks_vector_length(enc_vec):
     # 4) 알 수 없으면 None 반환 (검사 생략)
     return None
 
+def _he_inner_product_rot(enc_vec, plain_vec):
+    tmp = enc_vec * float(plain_vec[0])
+    for i, w in enumerate(plain_vec[1:], start=1):
+        rotated = enc_vec.rotate(i)
+        tmp = tmp + (rotated * float(w))
+    return tmp
 
 def ckks_matmul(enc_vec, plain_mat):
     """
@@ -74,26 +81,29 @@ def ckks_matmul(enc_vec, plain_mat):
     """
     # 입력 검증
     if not isinstance(plain_mat, np.ndarray):
+        plain_mat = np.asarray(plain_mat)
         # plain_mat이 1차원 벡터라면 리스트로 변환해 dot을 시도
+        #try:
+        #    return enc_vec.dot(np.asarray(plain_mat).tolist())
+        #except Exception as e:
+        #    raise ValueError("plain_mat must be a numpy array (2D) or a 1D-like iterable") from e
+
+    if plain_mat.ndim != 2:
+        raise ValueError("plain_mat must be 2D (d x r)")
+    
+    d, r = plain_mat.shape
+
+    # enc_vec 길이를 안전히 얻어보고, 가능하면 차원 일치 검사
+    vec_len = _get_ckks_vector_length(enc_vec)
+    if vec_len is not None and vec_len < d:
+        raise ValueError(f"CKKS vector slots ({vec_len}) < required dim ({d})")
+
+    # 각 열(column)마다 enc_vec.dot(col) -> 암호화된 스칼라(보통 CKKSVector 형태) 반환
+    result = []
+    for j in range(r):
+        col = plain_mat[:, j].tolist()
         try:
-            return enc_vec.dot(np.asarray(plain_mat).tolist())
-        except Exception as e:
-            raise ValueError("plain_mat must be a numpy array (2D) or a 1D-like iterable") from e
-
-    if plain_mat.ndim == 2:
-        n, d = plain_mat.shape
-
-        # enc_vec 길이를 안전히 얻어보고, 가능하면 차원 일치 검사
-        vec_len = _get_ckks_vector_length(enc_vec)
-        if vec_len is not None and vec_len != n:
-            raise ValueError(f"Dimension mismatch: enc_vec length {vec_len} vs plain_mat rows {n}")
-
-        # 각 열(column)마다 enc_vec.dot(col) -> 암호화된 스칼라(보통 CKKSVector 형태) 반환
-        result = []
-        for i in range(d):
-            col = plain_mat[:, i].tolist()
             result.append(enc_vec.dot(col))
+        except Exception:
+            result.append(_he_inner_product_rot(enc_vec, col))
         return result
-    else:
-        # plain_mat이 1차원일 경우 (벡터) 간단히 dot 수행
-        return enc_vec.dot(plain_mat.tolist())
