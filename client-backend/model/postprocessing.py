@@ -18,13 +18,15 @@ class LLMPostprocessor:
         """
         모델 내부에서 마지막 LayerNorm 탐색 → LM Head에 로짓을 전달하기 전 적용되는 LayerNorm을 찾음
         """
-        candidates = [
-            m for n, m in module.named_modules()
-            if isinstance(m, torch.nn.LayerNorm) and ("ln_f" in n.lower() or "norm" in n.lower() or "final" in n.lower())
-        ]
-        # 마지막 LayerNorm이 LM Head 바로 앞에 위치
-        return candidates[-1] if candidates else None
-
+        candidates = []
+        for name, m in module.named_modules():
+            n = name.lower()
+            if isinstance(m, torch.nn.LayerNorm) or "ln_f" in n or "norm" in n or "layernorm" in n:
+                candidates.append((name, m))
+        if not candidates:
+            return None
+        return candidates[-1][1]  # 마지막 candidate 사용
+    
     def integrate_lora_delta_and_predict_token(
             self,
             dec_lora_delta: torch.Tensor,
