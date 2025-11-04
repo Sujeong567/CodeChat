@@ -3,7 +3,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import gc
 
 from common.config import LLM_NAME, BNB_COMPUTE_DTYPE, DEVICE, HF_CACHE_DIR
-from common.lora_utils import get_bnb_config
+from common.model_utils import get_bnb_config
 
 class BaseLLMLoader:
     def __init__(self):
@@ -37,7 +37,7 @@ class BaseLLMLoader:
             device_map="auto",
             torch_dtype=BNB_COMPUTE_DTYPE,
             cache_dir=HF_CACHE_DIR
-        ).to(DEVICE)
+        )
         self.base_model.eval() # 모델을 추론 모드로 설정
         print(f"[Client-Backend][BaseLLMLoader] Base LLM 로드 완료 (4비트 양자화, {DEVICE} 사용)")
 
@@ -58,9 +58,9 @@ class BaseLLMLoader:
         if self.base_model is None:
             raise RuntimeError("Base model not loaded. Call load_model() first.")
         
-        lm_head_weight = self.base_model.lm_head.weight.data.to(torch.float32) # shape (vocab_size, hidden_size)
+        lm_head_weight = self.base_model.lm_head.weight.data.to(torch.float32).to(DEVICE) # shape (vocab_size, hidden_size)
         if self.base_model.lm_head.bias is not None:
-            lm_head_bias = self.base_model.lm_head.bias.data.to(torch.float32) # shape (vocab_size,)
+            lm_head_bias = self.base_model.lm_head.bias.data.to(torch.float32).to(DEVICE) # shape (vocab_size,)
         else:
             lm_head_bias = torch.zeros(lm_head_weight.shape[0], dtype=torch.float32, device=DEVICE)
 
