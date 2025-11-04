@@ -73,7 +73,7 @@ class LLMPostprocessor:
             sampled_idx = torch.multinomial(topk_probs, num_samples=1).item()
             next_token_id = int(topk_idx[sampled_idx].item())
         else:
-            next_token_id = torch.multinomial(probs[0], num_sampels=1).item()
+            next_token_id = torch.multinomial(probs[0], num_samples=1).item()
 
         # 토큰 디코딩
         next_token_str = self.tokenizer.decode([next_token_id], skip_special_tokens=False)
