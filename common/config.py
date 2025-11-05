@@ -37,8 +37,7 @@ HE_SCHEME_TYPE = "CKKS"
 HE_POLY_MODULUS_DEGREE = 8192
 HE_COEFF_MOD_BIT_SIZES = [60, 40, 40, 60] # 두 번의 곱셈 연산 깊이 (X@A, (X@A)@B)
 HE_GLOBAL_SCALE_BITS = 40                 # FHE 연산의 전역 스케일 팩터 (2**40)
-HE_KEY_DIR = os.path.join(PROJECT_ROOT, "common", "he_keys") # HE 키 파일 저장 디렉토리
-
+HE_KEY_DIR = os.path.join(PROJECT_ROOT, "client-backend", "crypto", "keys") # HE 키 파일 저장 디렉토리
 # --- LLM 추론 설정 ---
 MAX_GEN_LENGTH = 50 # 각 요청에 대해 생성할 최대 토큰 수
 MAX_INPUT_LENGTH = 512 # 입력 프롬프트의 최대 토큰 길이
