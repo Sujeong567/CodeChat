@@ -5,7 +5,13 @@
 - CKKS 암호화/복호화
 - 기업 서버와 통신
 """
-
+"""
+전처리 호출 : preprocessing.py 함수 호출
+암호화 호출 : ckks_client.py 함수 호출
+서버로 전송 : main.py에서 직접 실행
+복호화 호출 : ckks_client.py 함수 호출
+후처리 호출 : postprocessing.py 함수 호출
+"""
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -43,10 +49,10 @@ from crypto.ckks_client import (
     serialize_context
 )
 
-# Base LLM 관련 import (이 파일들은 나중에 만들 예정)
-# from app.model.base_llm import load_base_llm
-# from app.model.preprocessing import preprocess_before_lora
-# from app.model.postprocessing import postprocess_after_lora
+# Base LLM 관련 import
+from model.base_llm import BaseLLMLoader
+
+
 
 
 # ============================================
@@ -124,18 +130,25 @@ async def startup_event():
     # 2. Base LLM 로딩
     print("📦 Step 2: Base LLM 로딩")
     print("-" * 70)
+
+    #BaseLLMLoader 객체 생성
+    llm_loader = BaseLLMLoader()
     
     try:
+
+        llm_loader.load_model()
+
+        # 전역 변수 base_model에 할당
+        global base_model
+        base_model = llm_loader.base_model
+
         # TODO: Base LLM 로드 코드 작성 후 주석 해제
-        # print(f"   모델명: {LLM_NAME}")
-        # print(f"   장치: {DEVICE}")
-        # base_model = load_base_llm()
-        # print("✅ Base LLM 로딩 완료!\n")
-        
-        # 임시 (Base LLM 코드 작성 전)
-        print("   ⚠️ Base LLM 로딩 코드 미구현 (TODO)")
-        print("   현재는 더미 모델 사용\n")
-        base_model = {"status": "dummy"}
+        print(f"**토크나이저:** {llm_loader.tokenizer.__class__.__name__}")
+        print(f"**모델:** {llm_loader.base_model.__class__.__name__}")
+        print(f"**Hidden Size:** {llm_loader.hidden_size}")
+        print(f"**EOS Token ID:** {llm_loader.eos_token_id}")
+        print(f"   장치: {DEVICE}")
+        print("✅ Base LLM 로딩 완료!\n")
         
     except Exception as e:
         print(f"❌ Base LLM 로딩 실패: {e}\n")
