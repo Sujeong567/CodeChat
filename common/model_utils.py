@@ -1,12 +1,10 @@
 # common/model_utils.py
-
-import torch
 from transformers import BitsAndBytesConfig
 from peft import LoraConfig
 
 from common.config import (
     BNB_COMPUTE_DTYPE, BNB_4BIT_QUANT_TYPE, BNB_4BIT_USE_DOUBLE_QUANT,
-    R_RANK, LORA_ALPHA_FACTOR, LORA_TARGET_MODULES, LORA_DROPOUT, LORA_BIAS, LORA_TASK_TYPE
+    R_RANK, LORA_ALPHA, LORA_TARGET_MODULES, LORA_BIAS, LORA_TASK_TYPE
 )
 
 def get_bnb_config() -> BitsAndBytesConfig:
@@ -22,9 +20,8 @@ def get_lora_config() -> LoraConfig:
     """LoRAConfig 객체를 생성하여 반환합니다."""
     return LoraConfig(
         r=R_RANK,
-        lora_alpha=LORA_ALPHA_FACTOR,
+        lora_alpha=LORA_ALPHA,
         target_modules=LORA_TARGET_MODULES,
-        lora_dropout=LORA_DROPOUT,
         bias=LORA_BIAS,
         task_type=LORA_TASK_TYPE
     )
