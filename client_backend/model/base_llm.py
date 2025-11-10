@@ -21,7 +21,10 @@ class BaseLLMLoader:
 
     @staticmethod
     def _find_final_layernorm(module: torch.nn.Module):
-        """모델 내부에서 final layernorm 추정 → 수백만 개의 행렬 곱으로 널뛰는 값 정규화"""
+        """
+        lm_head 직전의 최종 정규화 final_ln 모듈을 찾음
+        TODO: 모델에 맞는 방식을 적용하여 모듈을 찾아야 함
+        """
         candidates = []
         for name, m in module.named_modules():
             n_lower = name.lower()
@@ -49,7 +52,7 @@ class BaseLLMLoader:
         print("[BaseLLM] 토크나이저 로딩 완료.")
 
         print(f"[BaseLLM] Base LLM 로딩 중 (4-bit)...")
-        # float16으로 로드 → 메모리 절약
+        # float16으로 4비트 모델 로드 → 메모리 절약
         bnb_config = get_bnb_config()
         base_model = AutoModelForCausalLM.from_pretrained(
             LLM_NAME, quantization_config=bnb_config, device_map="auto",
@@ -68,12 +71,14 @@ class BaseLLMLoader:
 
         self._base_model = base_model
         lora_config = get_lora_config()
+
+        # Dtype 패치가 완료된 base_model을 PEFT로 감싸서 q_proj, v_proj에 LoRA 슬롯(LoraLayer) 생성
         self._peft_model = get_peft_model(self._base_model, lora_config)
 
-        self.reset_lora_weights()
+        self.reset_lora_weights()   # LoRA 슬롯을 0으로 비움
         print("[BaseLLM] LoRA 모델로 Wrapping 완료.")
 
-        self._register_lora_hooks()
+        self._register_lora_hooks() # 훅(Hook) 등록
 
         self._hidden_size = self._peft_model.config.hidden_size
         self._eos_token_id = self._tokenizer.eos_token_id
@@ -90,14 +95,17 @@ class BaseLLMLoader:
         print("[BaseLLM] 모든 LoRA 어댑터 가중치를 0으로 리셋했습니다.")
     
     def _register_lora_hooks(self):
+        """peft_model의 LoraLayer 모듈에 두 가지 훅(Hook) 등록"""
         self.clear_lora_hooks()
 
         def save_xL_input_hook(module, args):
+            """pre-hook: LoraLayer가 실행되기 직전에 호출 → LoraLayer의 입력 xL 텐서에서 마지막 토큰의 입력만 캡처"""
             last_token_input = args[0][:, -1, :]    # (Batch, Hidden)
             self._lora_xL_inputs_queue[module].append(last_token_input.detach().clone())
 
         def inject_delta_output_hook(module, input, output):
-            global GLOBAL_INJECTED_LORA_OUTPUT_DELTA
+            """post-hook: LoraLayer가 실행된 직후에 호출 → output 텐서의 마지막 토큰 부분에만 서버 델타를 더해서 반환"""
+            global GLOBAL_INJECTED_LORA_OUTPUT_DELTA    # 서버가 보내준 델타를 가져옴
             if GLOBAL_INJECTED_LORA_OUTPUT_DELTA is not None:
                 try:
                     # 델타를 출력 Dtype에 맞춤
@@ -128,6 +136,7 @@ class BaseLLMLoader:
         self._lora_xL_inputs_queue.clear()
 
     def get_lora_xL_input(self) -> torch.Tensor:
+        """preprocessing.py가 큐에 저장된 xL을 가져갈 수 있도록 함"""
         first_module_queue = next(iter(self._lora_xL_inputs_queue.values()))
         if not first_module_queue:
             raise RuntimeError(f"LoRA XL 입력이 캡처되지 않았습니다.")
