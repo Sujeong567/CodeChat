@@ -6,8 +6,7 @@ from common.config import DEVICE, MAX_GEN_LENGTH
 
 class LLMPreProcessor:
     """
-    Forward pass 및 상태 관리
-    - bfloat16 상태 반환
+    Forward pass하여 훅(Hook) 트리거 → xL과 final_hidden_state 추출
     """
     def __init__(self, llm_loader: BaseLLMLoader):
         self.llm_loader = llm_loader
@@ -34,8 +33,8 @@ class LLMPreProcessor:
                 use_cache=True
             )
         
+        lora_xL_input = self.llm_loader.get_lora_xL_input() # 훅이 캡처한 xL (Batch, Hidden) 가져옴
         # bfloat16으로 상태 반환 → float16과 메모리 크기 같으나 수치 범위가 float32만큼 넓어 100번의 루프 동안 값이 오염되는 것 방지
-        lora_xL_input = self.llm_loader.get_lora_xL_input() # 훅이 캡처한 (Batch, Hidden) 벡터
         current_llm_hidden_state = outputs.hidden_states[-1][0, -1, :].to(torch.bfloat16)
 
         return {
@@ -47,12 +46,7 @@ class LLMPreProcessor:
         }
 
     def get_next_token_states(self, next_token_id: int, prev_state: dict) -> dict:
-        """
-        다음 토큰 상태 업데이트
-        - current_input_token_ids: 예측된 다음 토큰 하나만을 입력으로 사용
-        - attention_mask: 어텐션 마스크를 업데이트하여 새로 추가된 토큰 포함
-        - past_key_values: 이전 스텝에서 생성된 Key-Value 캐시를 다음 스텝에 전달하여 효율적인 어텐션 계산 수행
-        """
+        """다음 토큰 상태 업데이트"""
         peft_model = self.llm_loader.peft_model
         next_input_token = torch.tensor([[next_token_id]], device=self.device)
 
@@ -71,7 +65,7 @@ class LLMPreProcessor:
             )
         
         lora_xL_input = self.llm_loader.get_lora_xL_input() # 새 xL
-        current_llm_hidden_state = outputs.hidden_states[-1][0, -1, :].to(torch.bfloat16) # bfloat16으로 상태 반환
+        current_llm_hidden_state = outputs.hidden_states[-1][0, -1, :].to(torch.bfloat16) # 델타가 반영된 최종 hidden state를 bfloat16으로 반환
 
         prev_state.update({
             "attention_mask": new_mask,

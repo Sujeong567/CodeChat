@@ -6,11 +6,9 @@ from .base_llm import BaseLLMLoader
 from common.config import DEVICE
 
 class LLMPostProcessor:
-    """
-    델타 주입, 토큰 예측, 최종 디코딩
-    - float16 LayerNorm을 float32로 캐스팅
-    """
+    """preprocessing가 전달한 final_hidden_state를 받아 다음 토큰 1개 예측"""
     def __init__(self, llm_loader: BaseLLMLoader):
+        """llm_loader로부터 Dtype 패치가 완료된 lm_head_weights와 final_ln_float32 모듈을 받음"""
         self.tokenizer = llm_loader._tokenizer
         self.lm_head_weight, self.lm_head_bias = llm_loader.get_lm_head_weights()
         self.eos_token_id = llm_loader.eos_token_id
@@ -25,23 +23,25 @@ class LLMPostProcessor:
         current_llm_hidden_state: torch.Tensor, # (bfloat16)
     ) -> tuple[int, str]:
         
-        # 1. 델타 주입 (bfloat16 -> float32) + (float32) = (float32)
+        # 델타 주입 (bfloat16 -> float32) + (float32) = (float32)
         normed = current_llm_hidden_state.to(torch.float32).to(self.device)
         
         if self.final_ln_float32 is not None:
             try:
+                # float32 텐서를 LayerNorm 모듈에 통과시킴
                 normed = self.final_ln_float32(normed)
             except Exception as e:
                 print(f"WARN: final LayerNorm 적용 실패: {e}")
 
+        # float32 텐서를 LM Head 가중치와 곱함
         final_logits = normed @ self.lm_head_weight.T + self.lm_head_bias
 
+        # argmax → 모델이 EOS 토큰을 생성하면 확실하게 EOS를 선택하도록 함
         next_token_id = torch.argmax(final_logits, dim=-1).item()
 
         next_token_char = self.tokenizer.decode([next_token_id], skip_special_token=False)
         return next_token_id, next_token_char
  
-        # 4. Top-k 샘플링
         """
         생성된 final_logits 중 다음 토큰 1개 선택
         - Top-k (확률적 샘플링)
