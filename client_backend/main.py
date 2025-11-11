@@ -75,26 +75,26 @@ async def generate(request: ClientBackendRequest):
     try:
         print(f"추론 요청 수신: 프롬프트 '{request.prompt[:50]}...")
 
-        # 매 추론 시작 시 LoRA 가중치 0으로 리셋
+        # --- 1. 매 추론 시작 시 LoRA 가중치 0으로 리셋 ---
         app_state["llm_loader"].reset_lora_weights()
 
-        # --- 1. 초기 상태 → hidden_state와 캐시를 받음 ---
+        # --- 2. peft_model 1회 실행 → (초기 상태) xL_to_encrypt와 current_llm_hidden_state 캡처 ---
         llm_states = app_state["preprocessor"].get_initial_states(request.prompt)
         generated_ids = llm_states["generated_ids"][:]
 
         current_llm_hidden_state = llm_states["current_llm_hidden_state"]
         xL_to_encrypt = llm_states["lora_xL_input"] # (Batch, Hidden)
         
-        # --- 2. 토큰 생성 루프 ---
+        # --- 3. 토큰 생성 루프 ---
         for i in range(request.max_new_tokens):
             print(f"\n  Token {i+1}/{request.max_new_tokens}")
 
-            # --- (3) 클라이언트: hidden_state 암호화 ---
-            print("  (3) [Client] Hidden State 암호화 중...")
+            # --- 4. 현재 xL 암호화 ---
+            print("  (>>) [Client] Hidden State 암호화 중...")
             enc_xL_bytes = app_state["ckks_manager"].encrypt_tensor(xL_to_encrypt)
             
-            # --- (4) 클라이언트: 서버 전송 ---
-            print("  (4) [Client] 서버로 암호문 전송 중...")
+            # --- 5. 암호문 서버 전송 ---
+            print("  (>>) [Client] 서버로 암호문 전송 중...")
             req_data = EncryptedInferenceRequest(
                 enc_hidden_state_bytes=encode_bytes_to_base64(enc_xL_bytes)
             )
@@ -106,8 +106,8 @@ async def generate(request: ClientBackendRequest):
             
             res_data = model_validate(EncryptedInferenceResponse, server_response.json())
             
-            # --- (6) 클라이언트: LoRA 델타 복호화 ---
-            print("  (6) [Client] LoRA 델타 복호화 중...")
+            # --- 6. 서버로부터 LoRA 델타를 받아 복호화 ---
+            print("  (>>) [Client] LoRA 델타 복호화 중...")
             enc_lora_output_delta_bytes = decode_base64_to_bytes(res_data.enc_lora_delta_bytes)
             dec_lora_output_delta = app_state["ckks_manager"].decrypt_tensor(enc_lora_output_delta_bytes)
             
@@ -116,10 +116,11 @@ async def generate(request: ClientBackendRequest):
             else:
                 dec_lora_output_delta_2D = dec_lora_output_delta.to(DEVICE)
             
+            # --- 7. 훅(Hook)이 사용할 수 있도록 델타를 전역 변수에 설정
             app.state["llm_loader"].set_global_lora_output_delta(dec_lora_output_delta_2D)
             
-            # --- (6) 클라이언트: 다음 토큰 예측 ---
-            print("  (6) [Client] 다음 토큰 예측 중...")
+            # --- 8. current_llm_hidden_state(아직 델타 반영 x) 기반으로 다음 토큰 예측 ---
+            print("  (>>) [Client] 다음 토큰 예측 중...")
             next_token_id, next_token_char = app_state["postprocessor"].integrate_lora_delta_and_predict_token(
                 current_llm_hidden_state=current_llm_hidden_state
             )
@@ -131,14 +132,19 @@ async def generate(request: ClientBackendRequest):
                 print("\n  EOS 토큰 감지. 생성 종료.")
                 break
             
-            # --- (7) 클라이언트: 상태 업데이트 → hidden_state와 캐시 업데이트 ---
+            # --- 9. 예측된 next_token_id로 모델 다시 실행 → 상태 업데이트 ---
+            # --- 이때 inject_delta_output_hook: (7)에서 설정한 델타 주입
+            # --- save_xL_input_hook: 다음 루프(i+1)에서 쓸 새로운 xL 캡처
             llm_states = app_state["preprocessor"].get_next_token_states(next_token_id, llm_states)
 
+            # 델타 주입이 끝났으므로 전역 변수를 비움
             app_state["llm_loader"].clear_global_lora_output_delta()
             current_llm_hidden_state = llm_states["current_llm_hidden_state"]
+
+            # (9)에서 캡처한 새 xL을 다음 루프의 암호화 대상으로 설정
             xL_to_encrypt = llm_states["lora_xL_input"] # 새 xL (Batch, Hidden)
 
-        # --- 3. 최종 결과 반환 ---
+        # --- 10. 최종 결과 반환 ---
         final_text = app_state["postprocessor"].decode_final_output(generated_ids)
         processing_time = time.time() - start_time
 
