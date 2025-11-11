@@ -36,7 +36,7 @@ def create_ckks_context() -> ts.Context:
 
 def get_or_create_he_keys():
     """키 파일이 없으면 생성하고, 있으면 로드하여 클라이언트와 서버 컨텍스트 반환"""
-    os.makedirs(HE_KEY_DIR, exist_ke=True)
+    os.makedirs(HE_KEY_DIR, exist_ok=True)
 
     if os.path.exists(CLIENT_SECRET_KEY_PATH) and os.path.exists(SERVER_PUBLIC_KEY_PATH):
         # 키 파일이 이미 존재하는 경우
