@@ -33,7 +33,7 @@ def load_lora_adapter(lora_path: str = None):
     """
     
     if lora_path is None:
-        lora_path = "./models/lora_weights/checkpoint-final"
+        lora_path = "./server/lora/lora_weights_checkpoints_final"
     
     lora_path = Path(lora_path)
     
@@ -42,17 +42,17 @@ def load_lora_adapter(lora_path: str = None):
     print(f"{'='*60}\n")
     
     # 파일 존재 확인
-    adapter_file = lora_path / "adapter_model.bin"
+    adapter_file = lora_path / "adapter_model.safetensors"
     config_file = lora_path / "adapter_config.json"
     
     if not adapter_file.exists():
-        raise FileNotFoundError(f"adapter_model.bin 없음: {adapter_file}")
+        raise FileNotFoundError(f"adapter_model.safetensors 없음: {adapter_file}")
     
     if not config_file.exists():
         raise FileNotFoundError(f"adapter_config.json 없음: {config_file}")
     
     print("✅ 파일 발견!")
-    print(f"   - adapter_model.bin: {adapter_file.stat().st_size / 1024 / 1024:.2f} MB")
+    print(f"   - adapter_model.safetensors: {adapter_file.stat().st_size / 1024 / 1024:.2f} MB")
     print(f"   - adapter_config.json: {config_file.stat().st_size / 1024:.2f} KB\n")
     
     # config 로드
@@ -138,3 +138,7 @@ def extract_lora_matrices(weights: dict, layer_name: str):
     print(f"   LoRA B shape: {lora_B.shape}")
     
     return lora_A, lora_B
+
+
+
+
