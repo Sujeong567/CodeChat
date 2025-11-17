@@ -6,7 +6,7 @@ LoRA A, B 행렬을 메모리에 올림
 
 """
 LoRA 어댑터 로딩
-- adapter_model.bin, adapter_config.json 읽기
+- adapter_model.bin, adapter_model.safetensors 읽기
 - LoRA A, B 행렬 메모리에 로드
 """
 
@@ -14,6 +14,7 @@ import torch
 import json
 import os
 from pathlib import Path
+from safetensors.torch import load_file
 
 
 def load_lora_adapter(lora_path: str = None):
@@ -67,7 +68,7 @@ def load_lora_adapter(lora_path: str = None):
     
     # 가중치 로드
     print("📦 LoRA 가중치 로딩 중...")
-    weights = torch.load(adapter_file, map_location="cpu")
+    weights = load_file(str(adapter_file))
     
     num_params = sum(p.numel() for p in weights.values())
     print(f"   전체 파라미터: {num_params:,}\n")
@@ -139,6 +140,23 @@ def extract_lora_matrices(weights: dict, layer_name: str):
     
     return lora_A, lora_B
 
+
+
+
+if __name__ == "__main__":
+
+    lora_folder = "./server/lora/lora_weights_checkpoints_final"
+
+    
+    lora_data=load_lora_adapter()
+
+    weights = lora_data['weights']
+
+    # 4. 테스트할 레이어 이름 (예시; 실제 존재하는 레이어 키에 맞게 수정)
+    test_layer_name = list(weights.keys())[0].split('lora_A')[0].rstrip('.')
+
+    # 5. LoRA A, B 행렬 추출 및 출력
+    lora_A, lora_B = extract_lora_matrices(weights, test_layer_name)
 
 
 
