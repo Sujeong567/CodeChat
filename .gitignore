@@ -1,0 +1,35 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# HF cache (GB급)
+hf_cache/
+python_cache/
+.cache/
+~/.cache/
+
+# Model files (huge)
+*.safetensors
+*.bin
+*.pt
+*.pth
+model-*-of-*.safetensors
+model.safetensors
+
+# Venv
+venv/
+.env/
+
+# VSCode / PyCharm
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temp
+tmp/
+outputs/
+logs/
+*.log

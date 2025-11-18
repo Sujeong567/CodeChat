@@ -7,7 +7,10 @@ class EncryptedInferenceRequest(BaseModel):
 
 
 class EncryptedInferenceResponse(BaseModel):
-    enc_lora_delta_bytes: str  # Base64 인코딩된 bytes
+    enc_q_delta_bytes: str
+    enc_k_delta_bytes: str
+    enc_v_delta_bytes: str
+    enc_o_delta_bytes: str
 
 
 class ClientBackendRequest(BaseModel):

@@ -56,25 +56,47 @@ def extract_lora_matrices(weights: dict, layer_name: str):
     return W_A, W_B
 
 def get_fhe_lora_tensors(lora_path: str = None):
+    """
+    return:
+    {
+        "q_proj": (W_A_pt, W_B_pt),
+        "k_proj": (W_A_pt, W_B_pt),
+        "v_proj": (W_A_pt, W_B_pt),
+        "o_proj": (W_A_pt, W_B_pt)
+    }
+    """
+    TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    results = {}
+
     try:
         lora_data = load_lora_adapter(lora_path)
         weights = lora_data["weights"]
 
-        layer_name = f"model.layers.{TARGET_LAYER_INDEX}.self_attn.{REPRESENTATIVE_LORA_TARGET_MODULE}"
-        W_A, W_B = extract_lora_matrices(weights, layer_name)
+        for module_name in TARGETS:
+            layer_key = f"model.layers.{TARGET_LAYER_INDEX}.self_attn.{module_name}"
+            W_A, W_B = extract_lora_matrices(weights, layer_key)
 
-        # transpose 해서 (hidden, r), (r, hidden) 형태로 맞추기
-        W_A_pt = ts.plain_tensor(W_A.T.float().tolist())
-        W_B_pt = ts.plain_tensor(W_B.T.float().tolist())
+            # (r, hidden) → transpose → (hidden, r)
+            W_A_pt = ts.plain_tensor(W_A.T.float().tolist())  
+            W_B_pt = ts.plain_tensor(W_B.T.float().tolist())
 
-        print("[Adapter] TenSEAL PlainTensor 변환 완료.")
-        return W_A_pt, W_B_pt
+            results[module_name] = (W_A_pt, W_B_pt)
+
+        print("[Adapter] 모든 proj에 대한 TenSEAL PlainTensor 변환 완료.")
+        return results
 
     except Exception as e:
         print(f"[Adapter] 가중치 준비 실패: {e}")
-        print("[Adapter] 0 텐서로 대체합니다.")
-        W_A = torch.zeros(R_RANK, HIDDEN_SIZE).float()
-        W_B = torch.zeros(HIDDEN_SIZE, R_RANK).float()
-        W_A_pt = ts.plain_tensor(W_A.T.tolist())
-        W_B_pt = ts.plain_tensor(W_B.T.tolist())
-        return W_A_pt, W_B_pt
+        print("[Adapter] 0 텐서 4개 모두 대체합니다.")
+
+        results = {}
+        for module_name in TARGETS:
+            W_A = torch.zeros(R_RANK, HIDDEN_SIZE).float()
+            W_B = torch.zeros(HIDDEN_SIZE, R_RANK).float()
+
+            W_A_pt = ts.plain_tensor(W_A.T.tolist())
+            W_B_pt = ts.plain_tensor(W_B.T.tolist())
+
+            results[module_name] = (W_A_pt, W_B_pt)
+
+        return results
