@@ -16,8 +16,8 @@ from common.config import (
 )
 from common.model_utils import get_bnb_config, get_lora_config
 
-# 서버에서 계산한 LoRA 델타를 임시로 담아두는 전역 변수
-GLOBAL_INJECTED_LORA_OUTPUT_DELTA = None
+# proj별 델타를 관리하는 전역 dict
+GLOBAL_INJECTED_LORA_OUTPUT_DELTA = {}
 
 
 class BaseLLMLoader:
@@ -134,81 +134,70 @@ class BaseLLMLoader:
 
     def _register_lora_hooks(self):
         """
-        - 대표 LoRA 레이어(예: model.layers.0.self_attn.q_proj)에만 Hook 1쌍 등록
-        - pre-hook: 마지막 토큰의 입력 xL 캡처
-        - post-hook: 서버에서 받은 델타를 출력의 마지막 토큰 위치에 더함
+        하나의 레이어(TARGET_LAYER_INDEX)의 self_attn.{q,k,v,o}_proj에 대해 hook 등록.
+        - q_proj: x_L 캡처 + delta 주입
+        - k/v/o_proj: delta 주입만
         """
         self.clear_lora_hooks()
 
-        # StarCoder2에서 q_proj 이름 패턴 (Peft 래핑 후 prefix 포함)을 부분 매칭으로 찾기
-        # ex) "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default"
-        target_signature = f"layers.{TARGET_LAYER_INDEX}.self_attn.{REPRESENTATIVE_LORA_TARGET_MODULE}"
+        TARGET_LAYER = TARGET_LAYER_INDEX
+        TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-        # --- hook 내부 함수들 (반드시 _register_lora_hooks 안에 중첩 함수로 정의!) ---
         def save_xL_input_hook(module, args):
-            """
-            LoraLayer 실행 직전 입력 캡처.
-            args[0] shape: (batch, seq_len, hidden)
-            우리는 마지막 토큰의 hidden만 사용 → (batch, hidden) 형태로 큐에 push.
-            """
-            x = args[0]  # (B, S, H)
-            try:
-                last_token_input = x[:, -1, :].detach().clone()  # (B, H)
-                self._lora_xL_inputs_queue.append(last_token_input)
-                print(f"[HOOK] xL captured: {last_token_input.shape}")
-            except Exception as e:
-                print(f"[BaseLLM] WARN: xL 캡처 실패: {e}")
+            # args[0]: (batch, seq, hidden)
+            x = args[0]
+            last_token_input = x[:, -1, :].detach().clone()
+            self._lora_xL_inputs_queue.append(last_token_input)
+            print(f"[HOOK] xL captured: {last_token_input.shape}")
 
-        def inject_delta_output_hook(module, input, output):
-            """
-            LoraLayer 실행 직후 호출.
-            GLOBAL_INJECTED_LORA_OUTPUT_DELTA에 저장된 델타를
-            출력 텐서의 마지막 토큰 위치에 더해준다.
-            output shape: (batch, seq_len, hidden)
-            """
-            global GLOBAL_INJECTED_LORA_OUTPUT_DELTA
-            if GLOBAL_INJECTED_LORA_OUTPUT_DELTA is None:
-                return output
+        def make_inject_delta_hook(proj_key: str):
+            def _inject(module, input, output):
+                global GLOBAL_INJECTED_LORA_OUTPUT_DELTAS
+                delta = GLOBAL_INJECTED_LORA_OUTPUT_DELTAS.get(proj_key)
+                if delta is None:
+                    return output
 
-            delta = GLOBAL_INJECTED_LORA_OUTPUT_DELTA
-            try:
-                # delta: (B, H) 또는 (H,)
-                if delta.dim() == 1:
-                    # (H,) -> (1, H)
-                    delta = delta.unsqueeze(0)
-                if delta.dim() == 2:
-                    # (B, H) -> (B, 1, H) : seq_len 차원에 브로드캐스트 가능하게
-                    delta = delta.unsqueeze(1)
+                # delta: (H,) 또는 (1, H) 허용
+                if delta.dim() == 2 and delta.shape[0] == 1:
+                    delta_use = delta[0]
+                else:
+                    delta_use = delta
 
-                if delta.shape[-1] != output.shape[-1]:
+                if delta_use.shape[-1] != output.shape[-1]:
                     print(
-                        f"[BaseLLM] WARN: LoRA 델타 주입 실패: "
-                        f"delta={delta.shape}, output={output.shape}"
+                        f"[DELTA] Skip {proj_key}: delta={delta_use.shape}, output={output.shape}"
                     )
                     return output
 
-                delta = delta.to(device=output.device, dtype=output.dtype)
-                # 마지막 토큰 위치에만 델타 추가: output[:, -1:, :] shape (B, 1, H)
-                output[:, -1:, :] = output[:, -1:, :] + delta
+                out = output.clone()
+                out[:, -1, :] = out[:, -1, :] + delta_use.to(out.dtype)
                 print(
-                    f"[DELTA] Injected delta at module={module.__class__.__name__}, "
-                    f"delta_shape={delta.shape}, output_shape={output.shape}"
+                    f"[DELTA] Injected delta for {proj_key} at module={module.__class__.__name__}, "
+                    f"delta_shape={delta_use.shape}, output_shape={out.shape}"
                 )
-            except Exception as e:
-                print(f"[BaseLLM] WARN: LoRA 델타 주입 예외: {e}")
-            return output
+                return out
 
-        # 실제로는 대표 레이어 하나에만 Hook 등록
+            return _inject
+
         for name, module in self._peft_model.named_modules():
-            if isinstance(module, LoraLayer) and target_signature in name:
-                pre_h = module.register_forward_pre_hook(save_xL_input_hook)
-                post_h = module.register_forward_hook(inject_delta_output_hook)
-                self._xL_pre_hooks.append(pre_h)
-                self._output_post_hooks.append(post_h)
-                print(f"[HOOK] Registered hooks at: {name}")
-                break
-        else:
-            print(f"[BaseLLM] WARN: 대상 LoRA 레이어를 찾지 못했습니다: {target_signature}")
+            if not isinstance(module, LoraLayer):
+                continue
+            if f".layers.{TARGET_LAYER}.self_attn." not in name:
+                continue
+
+            for proj_key in TARGET_MODULES:
+                if f".self_attn.{proj_key}" in name:
+                    # q_proj 하나에서만 x_L 캡처
+                    if proj_key == "q_proj":
+                        pre_hook = module.register_forward_pre_hook(save_xL_input_hook)
+                        self._xL_pre_hooks.append(pre_hook)
+
+                    hook = module.register_forward_hook(make_inject_delta_hook(proj_key))
+                    self._output_post_hooks.append(hook)
+
+                    print(f"[HOOK] Registered hooks at: {name} ({proj_key})")
+                    break
+
 
     def clear_lora_hooks(self):
         """등록된 hook 제거 및 큐 초기화"""
@@ -230,19 +219,23 @@ class BaseLLMLoader:
             raise RuntimeError("캡처된 xL 입력이 없습니다.")
         return self._lora_xL_inputs_queue.popleft()
 
-    def set_global_lora_output_delta(self, delta: torch.Tensor):
+    def set_global_lora_output_deltas(self, delta_dict: dict):
         """
-        서버에서 복호화한 LoRA 델타를 전역 변수에 세팅.
-        - 기대 shape: (1, hidden) 또는 (hidden,)
+        delta_dict: {"q_proj": tensor(1, H), ...}
         """
-        global GLOBAL_INJECTED_LORA_OUTPUT_DELTA
-        GLOBAL_INJECTED_LORA_OUTPUT_DELTA = delta
-        print(f"[BaseLLM] Global LoRA delta set: {tuple(delta.shape)}")
+        global GLOBAL_INJECTED_LORA_OUTPUT_DELTAS
+        GLOBAL_INJECTED_LORA_OUTPUT_DELTAS = {}
+        for k, v in delta_dict.items():
+            GLOBAL_INJECTED_LORA_OUTPUT_DELTAS[k] = v.detach().to(torch.float32)
 
-    def clear_global_lora_output_delta(self):
-        """한 토큰 step에서 델타 사용이 끝난 뒤 반드시 호출"""
-        global GLOBAL_INJECTED_LORA_OUTPUT_DELTA
-        GLOBAL_INJECTED_LORA_OUTPUT_DELTA = None
+        keys = ", ".join(
+            f"{k}:{tuple(v.shape)}" for k, v in GLOBAL_INJECTED_LORA_OUTPUT_DELTAS.items()
+        )
+        print(f"[BaseLLM] Global LoRA deltas set: {keys}")
+
+    def clear_global_lora_output_deltas(self):
+        global GLOBAL_INJECTED_LORA_OUTPUT_DELTAS
+        GLOBAL_INJECTED_LORA_OUTPUT_DELTAS.clear()
 
     # ------------------------------------------------------------------
     #  프로퍼티 / LM Head 가중치

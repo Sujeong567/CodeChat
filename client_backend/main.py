@@ -108,15 +108,29 @@ async def generate(request: ClientBackendRequest):
             res.raise_for_status()
             resp_obj = model_validate(EncryptedInferenceResponse, res.json())
 
-            # 4) 서버에서 계산한 LoRA delta 복호화
-            delta_bytes = decode_base64_to_bytes(resp_obj.enc_lora_delta_bytes)
-            delta_vec = ckks.decrypt_tensor(delta_bytes)  # (H,)
-            print("[CLIENT] delta norm:", delta_vec.norm().item())
-            
-            delta_tensor = delta_vec.to(DEVICE)
+            # 4) 서버에서 계산한 LoRA delta 4개 복호화
+            delta_q = ckks.decrypt_tensor(
+                decode_base64_to_bytes(resp_obj.enc_lora_delta_q_proj)
+            ).unsqueeze(0).to(DEVICE)
+            delta_k = ckks.decrypt_tensor(
+                decode_base64_to_bytes(resp_obj.enc_lora_delta_k_proj)
+            ).unsqueeze(0).to(DEVICE)
+            delta_v = ckks.decrypt_tensor(
+                decode_base64_to_bytes(resp_obj.enc_lora_delta_v_proj)
+            ).unsqueeze(0).to(DEVICE)
+            delta_o = ckks.decrypt_tensor(
+                decode_base64_to_bytes(resp_obj.enc_lora_delta_o_proj)
+            ).unsqueeze(0).to(DEVICE)
 
-            # 5) 델타를 전역에 설정 (hook이 사용)
-            loader.set_global_lora_output_delta(delta_tensor)
+            # 5) 델타들을 전역에 설정 (hook이 proj별로 사용)
+            loader.set_global_lora_output_deltas(
+                {
+                    "q_proj": delta_q,
+                    "k_proj": delta_k,
+                    "v_proj": delta_v,
+                    "o_proj": delta_o,
+                }
+            )
 
             # 6) 현재 hidden state 기반으로 다음 토큰 argmax
             next_token_id, next_token_char = postproc.integrate_lora_delta_and_predict_token(
@@ -134,7 +148,7 @@ async def generate(request: ClientBackendRequest):
             states = preproc.get_next_token_states(next_token_id, states)
 
             # 8) 델타 주입 완료 후 전역 delta 초기화
-            loader.clear_global_lora_output_delta()
+            loader.clear_global_lora_output_deltas()
 
         final_text = postproc.decode_final_output(generated_ids)
         elapsed = time.time() - start_time

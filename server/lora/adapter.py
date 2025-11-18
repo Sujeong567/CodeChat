@@ -65,14 +65,14 @@ def get_fhe_lora_tensors(lora_path: str = None):
         "o_proj": (W_A_pt, W_B_pt)
     }
     """
-    TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
     results = {}
 
     try:
         lora_data = load_lora_adapter(lora_path)
         weights = lora_data["weights"]
 
-        for module_name in TARGETS:
+        for module_name in TARGET_MODULES:
             layer_key = f"model.layers.{TARGET_LAYER_INDEX}.self_attn.{module_name}"
             W_A, W_B = extract_lora_matrices(weights, layer_key)
 
@@ -90,7 +90,7 @@ def get_fhe_lora_tensors(lora_path: str = None):
         print("[Adapter] 0 텐서 4개 모두 대체합니다.")
 
         results = {}
-        for module_name in TARGETS:
+        for module_name in TARGET_MODULES:
             W_A = torch.zeros(R_RANK, HIDDEN_SIZE).float()
             W_B = torch.zeros(HIDDEN_SIZE, R_RANK).float()
 
