@@ -1,138 +1,78 @@
-"""
-기업 서버 메인
-- LoRA 가중치 보유
-- 암호화된 hidden states 수신
-- LoRA 연산 (암호문 상태)
-- 결과 반환
-"""
-
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import uvicorn
-import sys
+# server/main.py
 import os
-from typing import List
+import sys
 
-# ============================================
-# Python 경로 설정
-# ============================================
+import uvicorn
+import tenseal as ts
+from fastapi import FastAPI, HTTPException
+from contextlib import asynccontextmanager
+from pydantic import __version__ as pydantic_version
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)
-sys.path.insert(0, project_root)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
 
-print(f"📂 Current Dir: {current_dir}")
-print(f"📂 Project Root: {project_root}\n")
-
-# ============================================
-# Import
-# ============================================
-
-# 공통 설정
-from common.config import (
-    SERVER_HOST,
-    SERVER_PORT,
-    DEVICE
+from common.config import SERVER_HOST, SERVER_PORT, HE_POLY_MODULUS_DEGREE, HIDDEN_SIZE
+from common.he_context import load_server_context
+from common.protocol import (
+    EncryptedInferenceRequest,
+    EncryptedInferenceResponse,
+    encode_bytes_to_base64,
+    decode_base64_to_bytes,
 )
+from server.lora.adapter import get_fhe_lora_tensors
+from server.lora.inference import he_lora_inference
 
-# HE 관련
-from common.he_utils import load_tenseal_context
+PYDANTIC_V2 = pydantic_version.startswith("2.")
+def model_validate(model_cls, data):
+    return model_cls.model_validate(data) if PYDANTIC_V2 else model_cls.parse_obj(data)
 
-# LoRA 관련 (TODO: 실제 구현 필요)
-# from lora.adapter import load_lora_adapter
-# from lora.inference import lora_inference_encrypted
+app_state = {}
 
-# ============================================
-# FastAPI 앱
-# ============================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("[Server] 엔터프라이즈 서버 시작")
+    ctx = load_server_context()
+    app_state["he_context"] = ctx
 
-app = FastAPI(
-    title="CodeChat Enterprise Server",
-    description="기업 서버 - LoRA 가중치 보유 및 암호화 연산",
-    version="1.0.0"
-)
+    max_slots = HE_POLY_MODULUS_DEGREE // 2
+    if HIDDEN_SIZE > max_slots:
+        print(f"[Server] 경고: HiddenSize={HIDDEN_SIZE}, HE 슬롯={max_slots}")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 프로덕션에서는 제한 필요
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    W_A_pt, W_B_pt = get_fhe_lora_tensors()
+    app_state["W_A_pt"] = W_A_pt
+    app_state["W_B_pt"] = W_B_pt
 
-# ============================================
-# 전역 변수
-# ============================================
+    print("[Server] 준비 완료")
+    yield
+    print("[Server] 종료")
 
-lora_adapter = None          # LoRA 가중치
-public_context = None        # CKKS Public Context (비밀키 없음)
-server_initialized = False
+app = FastAPI(lifespan=lifespan)
 
-# ============================================
-# 서버 시작 이벤트
-# ============================================
-
-@app.on_event("startup")
-async def startup_event():
-    """서버 시작 시 초기화"""
-    global lora_adapter, public_context, server_initialized
-    
-    print("\n" + "="*70)
-    print("🏢 기업 서버 시작 중...")
-    print("="*70 + "\n")
-    
-    # 1. Public CKKS Context 로드 (main.py에서!)
+@app.post("/compute_lora", response_model=EncryptedInferenceResponse)
+async def compute_lora(request: EncryptedInferenceRequest):
     try:
-        public_context = load_tenseal_context("public_context.bin")
-        print("✅ Public Context 로드 완료!\n")
-    except Exception as e:
-        print(f"❌ Public Context 로드 실패: {e}\n")
-    
-    # 2. LoRA 어댑터 로드 (adapter.py 사용)
-    try:
-        from lora.adapter import load_lora_adapter
-        lora_adapter = load_lora_adapter("./models/lora_weights/checkpoint-final")
-        print("✅ LoRA 어댑터 로드 완료!\n")
-    except Exception as e:
-        print(f"❌ LoRA 로드 실패: {e}\n")
+        ctx: ts.Context = app_state["he_context"]
+        W_A_pt = app_state["W_A_pt"]
+        W_B_pt = app_state["W_B_pt"]
 
+        enc_bytes = decode_base64_to_bytes(request.enc_hidden_state_bytes)
+        enc_vec = ts.ckks_vector_from(ctx, enc_bytes)
 
-# ============================================
-# API - LoRA 추론
-# ============================================
+        result_bytes = he_lora_inference(enc_vec, W_A_pt, W_B_pt, ctx)
+        resp_b64 = encode_bytes_to_base64(result_bytes)
+        return EncryptedInferenceResponse(enc_lora_delta_bytes=resp_b64)
 
-@app.post("/api/lora/inference")
-async def lora_inference_endpoint(request: LoRAInferenceRequest):
-    """
-    암호화된 hidden states로 LoRA 연산
-    """
-    
-    try:
-        # 1. 암호문 복원
-        import tenseal as ts
-        serialized = bytes(request.encrypted_hidden_states)
-        encrypted_vector = ts.ckks_vector_from(public_context, serialized)
-        
-        # 2. LoRA 연산 (inference.py 사용, public_context 전달!)
-        from lora.inference import lora_inference_encrypted
-        result_encrypted = lora_inference_encrypted(
-            encrypted_vector,
-            lora_adapter,
-            public_context  # ← 여기서 전달!
-        )
-        
-        # 3. 결과 직렬화
-        result_serialized = result_encrypted.serialize()
-        result_bytes = list(result_serialized)
-        
-        return LoRAInferenceResponse(
-            status="success",
-            ciphertext=result_bytes,
-            size=request.size,
-            shape=request.shape,
-            message="LoRA 연산 완료"
-        )
-        
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "server.main:app",
+        host=SERVER_HOST,
+        port=SERVER_PORT,
+        reload=True,
+    )

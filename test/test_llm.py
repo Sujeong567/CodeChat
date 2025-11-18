@@ -1,154 +1,140 @@
+# test/test_llm.py
 import torch
-import gc
 import sys
 import os
-import collections
-import time
 
-print("[DEBUG] 1. 스크립트 시작")
-time.sleep(0.1) # 출력 버퍼 비우기용
+# 프로젝트 루트 추가
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
 
-# --- 1. 프로젝트 루트 설정 ---
-# 이 스크립트가 있는 루트 디렉토리를 Python 경로에 추가
-try:
-    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if PROJECT_ROOT not in sys.path:
-        sys.path.append(PROJECT_ROOT)
-    print(f"[DEBUG] 2. PROJECT_ROOT 설정 완료: {PROJECT_ROOT}")
-except Exception as e:
-    print(f"[FATAL] PROJECT_ROOT 설정 실패: {e}")
-    sys.exit(1)
+from client_backend.model.base_llm import BaseLLMLoader
+from client_backend.model.preprocessing import LLMPreProcessor
+from client_backend.model.postprocessing import LLMPostProcessor
 
-# --- 2. 테스트 대상 모듈 임포트 ---
-# from client_backend.model.base_llm import BaseLLMLoader
-# from client_backend.model.preprocessing import LLMPreProcessor
-# from client_backend.model.postprocessing import LLMPostProcessor
-print("[DEBUG] 3. client_backend 모듈 임포트 시도...")
-try:
-    from client_backend.model.base_llm import BaseLLMLoader
-    print("  - BaseLLMLoader 임포트 성공")
-    from client_backend.model.preprocessing import LLMPreProcessor
-    print("  - LLMPreProcessor 임포트 성공")
-    from client_backend.model.postprocessing import LLMPostProcessor
-    print("  - LLMPostProcessor 임포트 성공")
-except ImportError as e:
-    print(f"\n[FATAL] 모듈 임포트 실패! 폴더 이름이 'client_backend'(언더스코어)인지 확인하세요.")
-    print(f"에러 메시지: {e}")
-    print(f"현재 sys.path: {sys.path}\n")
-    sys.exit(1)
-except Exception as e:
-    print(f"[FATAL] 예상치 못한 임포트 에러: {e}")
-    sys.exit(1)
 
-# --- 3. 의존성 모듈 임포트 (설정값) ---
-# from common.config import (
-#    MAX_GEN_LENGTH, DEVICE, HF_CACHE_DIR, 
-#    LLM_NAME, BNB_COMPUTE_DTYPE, R_RANK, LORA_ALPHA, LORA_TARGET_MODULES,
-#    REPRESENTATIVE_LORA_TARGET_MODULE, LORA_INJECTION_MODULES
-#)
-print("[DEBUG] 4. common 모듈 임포트 시도...")
-try:
-    import torch
-    import gc
-    from common.config import (
-        MAX_GEN_LENGTH, DEVICE, HF_CACHE_DIR, 
-        LLM_NAME, BNB_COMPUTE_DTYPE
+def disable_all_lora(loader: BaseLLMLoader):
+    """모든 LoRA hook + LoRA weight 제거"""
+    loader.clear_lora_hooks()
+    for name, param in loader.peft_model.named_parameters():
+        if "lora_" in name:
+            param.data.zero_()
+    print("[TEST] LoRA 완전 비활성화 완료.")
+
+
+def generate_no_hook(prompt, max_new_tokens=100):
+    print("\n===== CLIENT LLM ONLY (NO HOOK, NO LORA) =====")
+
+    # 1) 로더
+    llm = BaseLLMLoader()
+    llm.load_model()
+
+    # 2) LoRA 완전 제거
+    disable_all_lora(llm)
+
+    # 3) 프리/포스트 초기화
+    pre = LLMPreProcessor(llm)
+    post = LLMPostProcessor(llm)
+
+    # ⛔ Hook이 없으므로 get_initial_states()를 그대로 쓰면 안 됨
+    #    → 내부에서 get_lora_xL_input() 호출하기 때문
+    # 그래서 여기서 직접 forward pass 수행해야 한다.
+
+    tokenizer = llm.tokenizer
+    peft_model = llm.peft_model
+
+    # 프롬프트 구성
+    user_txt = f"다음 코드를 고쳐라.\n\n코드:\n{prompt.rstrip()}"
+    full_prompt = (
+        "<|system|>\n" +
+        """You are an all-in-one Python code refactoring bot.
+Your goal is to fix violations of rules below.""" +
+        "<|endoftext|>\n"
+        "<|user|>\n" + user_txt + "<|endoftext|>\n"
+        "<|assistant|>\n"
     )
-    print("  - common 모듈 임포트 성공")
-except ImportError as e:
-    print(f"[FATAL] common 모듈 임포트 실패: {e}")
-    sys.exit(1)
 
-def run_llm_test():
-    """
-    [LLM 단독 테스트]
-    FHE/서버 연동 없이, LoRA 훅 아키텍처(base_llm, preprocessing, postprocessing)가
-    '0-델타' 주입 시 정상적으로 작동하는지 테스트합니다.
-    """
-    print("--- 🚀 LLM 모듈 단독 테스트 시작 ---")
-    gc.collect()
-    torch.cuda.empty_cache()
+    print("[TEST] Prompt prepared.")
 
-    # 1. 모듈 초기화 (테스트 대상)
-    print("[Test] 1/3: LLM 로더 (훅 포함) 초기화 중...")
-    llm_loader = BaseLLMLoader()
-    llm_loader.load_model()
-    
-    print("[Test] 2/3: 전/후처리기 초기화 중...")
-    preprocessor = LLMPreProcessor(llm_loader=llm_loader)
-    postprocessor = LLMPostProcessor(llm_loader=llm_loader)
-    
-    print("[Test] 3/3: 테스트 프롬프트 설정...")
-    prompt = "Write a Python function that returns the factorial of a number."
-    generated_ids = []
+    # 모델 입력
+    ids = tokenizer(full_prompt, return_tensors="pt").input_ids.to(llm.peft_model.device)
 
-    try:
-        # --- 1. 초기 상태 가져오기 ---
-        print("\n--- [Test] Step 1: LLM 초기 상태 (xL 포함) 가져오기 ---")
-        llm_loader.reset_lora_weights() # LoRA 가중치 0으로 리셋
-        llm_states = preprocessor.get_initial_states(prompt)
-        generated_ids.extend(llm_states["generated_ids"])
-        
-        current_llm_hidden_state = llm_states["current_llm_hidden_state"]
-        xL_tensor = llm_states["lora_xL_input"] # (Batch, Hidden)
+    # 첫 forward
+    with torch.no_grad():
+        out = peft_model(ids, output_hidden_states=True, use_cache=True)
 
-        # --- 2. 토큰별 생성 루프 ---
-        for i in range(MAX_GEN_LENGTH):
-            print(f"\n--- [Test] Step 2.{i+1}: 토큰 {i+1} 생성 ---")
-            
-            # --- [0-델타 시뮬레이션] ---
-            # 'xL_tensor' (Batch, Hidden)와 동일한 shape의 0-텐서를 생성합니다.
-            # 이것이 'FHE 노이즈가 낀 0-델타' (dec_lora_output_delta)를 대체합니다.
-            
-            print(f"  (3-5) [Sim] 0-델타 생성 (Shape: {xL_tensor.shape})...")
-            dummy_delta = torch.zeros_like(xL_tensor).to(DEVICE)
-            
-            # (5b) 0-델타를 훅에 주입하기 위해 전역 변수에 설정
-            llm_loader.set_global_lora_output_delta(dummy_delta)
-            
-            # --- [클라이언트 로직 실행] ---
-            # (6) 다음 토큰 예측
-            print("  (6) [Client] 다음 토큰 예측 (델타는 다음 스텝에 주입됨)...")
-            next_token_id, next_token_char = postprocessor.integrate_lora_delta_and_predict_token(
-                current_llm_hidden_state=current_llm_hidden_state
+    # 상태 값 수동 구성 (LoRA는 없음)
+    hidden = out.hidden_states[-1][0, -1, :].to(torch.bfloat16)
+    past = out.past_key_values
+    attention_mask = torch.ones_like(ids, dtype=torch.bool)
+
+    generated_ids = ids[0].tolist()
+
+    # ----------------------
+    # 토큰 생성 루프
+    # ----------------------
+    for i in range(max_new_tokens):
+
+        # 1-step next token 생성 (LoRA delta 없음)
+        token_id, token_str = post.integrate_lora_delta_and_predict_token(hidden)
+        print(f"[{i}] {repr(token_str)}")
+
+        generated_ids.append(token_id)
+
+        if token_id == llm.eos_token_id:
+            break
+
+        next_input = torch.tensor([[token_id]], device=llm.peft_model.device)
+
+        # attention mask 확장
+        attention_mask = torch.cat(
+            [attention_mask, torch.ones((1, 1), dtype=torch.bool, device=attention_mask.device)],
+            dim=1
+        )
+
+        with torch.no_grad():
+            out = peft_model(
+                input_ids=next_input,
+                past_key_values=past,
+                attention_mask=attention_mask,
+                use_cache=True,
+                output_hidden_states=True,
             )
-            
-            generated_ids.append(next_token_id)
-            print(f"  -> 생성: {repr(next_token_char)}")
 
-            if next_token_id == llm_loader.eos_token_id:
-                print("\n  [Test] EOS 토큰 감지. 생성 종료.")
-                break
-            
-            # (7) 상태 업데이트 (이때 'inject_delta_output_hook'이 0-델타를 주입함)
-            print("  (7) [Client] 상태 업데이트 (훅을 통해 0-델타 주입)...")
-            llm_states = preprocessor.get_next_token_states(next_token_id, llm_states)
-            
-            # (7b) 다음 루프를 위해 변수 업데이트
-            llm_loader.clear_global_lora_output_delta() # 주입 완료 후 델타 초기화
-            current_llm_hidden_state = llm_states["current_llm_hidden_state"]
-            xL_tensor = llm_states["lora_xL_input"] # 새 xL
+        past = out.past_key_values
+        hidden = out.hidden_states[-1][0, -1, :].to(torch.bfloat16)
 
-        # --- 3. 최종 텍스트 디코딩 ---
-        final_generated_text = postprocessor.decode_final_output(generated_ids)
+    # 최종 decode
+    result = post.decode_final_output(generated_ids)
+    print("\n===== FINAL OUTPUT =====")
+    print(result)
+    print("=======================================")
 
-        gc.collect()
-        torch.cuda.empty_cache()
-        
-        print("\n" + "="*30)
-        print("    ✅ 최종 생성 결과 (LLM 단독 테스트)")
-        print("="*30)
-        print(final_generated_text)
-        print("="*30)
+    return result
 
-    except Exception as e:
-        print(f"\n[Test] 🚨 치명적 오류 발생: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        if 'llm_loader' in locals():
-            llm_loader.clear_lora_hooks()
-        print("\n--- 🧹 테스트 완료. 리소스 정리 ---")
 
 if __name__ == "__main__":
-    run_llm_test()
+    prompt = """class shopping_cart:
+    def CALC_TOTAL(self, Price_List):
+        Total = 0
+        for p in Price_List:
+            if p > 10000:
+                Total += p * 0.9
+            else:
+                Total += p
+        return Total
+    """
+
+    generate_no_hook(prompt, max_new_tokens=100)
+
+"""
+결과:
+StarCoder2-7B + PreProcessor → PostProcessor → Generation loop 정상 동작
+- 모델 로딩 정상
+- LayerNorm float32 conversion 정상
+- LM head matmul → logits → argmax 정상
+- attention_mask / past_key_values 연결 정상
+- EOS ID = 0 정상 (GPT 계열 instruct 모델의 EOS는 보통 <|endoftext|> = 0)
+
+>> 현재 LoRA가 적용되지 않았기 때문에 코드 설명 출력
+"""

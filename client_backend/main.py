@@ -1,170 +1,164 @@
-# codechat/client-backend/main.py
-import torch
-import gc
-import sys
+# client_backend/main.py
 import os
-import requests
-import uvicorn
+import sys
 import time
-from fastapi import FastAPI, HTTPException, status
+import gc
+import requests
+
+import torch
+from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
 from pydantic import __version__ as pydantic_version
+import uvicorn
 
-# --- 1. 프로젝트 루트를 sys.path에 추가 ---
-# PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# if PROJECT_ROOT not in sys.path:
-#     sys.path.append(PROJECT_ROOT)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
 
-# --- 2. 모듈 임포트 ---
 from common.config import (
-    CLIENT_BACKEND_HOST, CLIENT_BACKEND_PORT, SERVER_HOST, SERVER_PORT,
-    MAX_GEN_LENGTH, DEVICE
+    CLIENT_BACKEND_HOST,
+    CLIENT_BACKEND_PORT,
+    SERVER_HOST,
+    SERVER_PORT,
+    DEVICE,
 )
 from common.protocol import (
-    ClientBackendRequest, ClientBackendResponse,
-    EncryptedInferenceRequest, EncryptedInferenceResponse,
-    encode_bytes_to_base64, decode_base64_to_bytes
+    ClientBackendRequest,
+    ClientBackendResponse,
+    EncryptedInferenceRequest,
+    EncryptedInferenceResponse,
+    encode_bytes_to_base64,
+    decode_base64_to_bytes,
 )
-from crypto.ckks_client import CKKSClientManager
-from model.base_llm import BaseLLMLoader
-from model.preprocessing import LLMPreProcessor
-from model.postprocessing import LLMPostProcessor
+from client_backend.crypto.ckks_client import CKKSClientManager
+from client_backend.model.base_llm import BaseLLMLoader
+from client_backend.model.preprocessing import LLMPreProcessor
+from client_backend.model.postprocessing import LLMPostProcessor
 
-# Pydantic V1/V2 호환성 처리
 PYDANTIC_V2 = pydantic_version.startswith("2.")
 def model_dump(model):
     return model.model_dump() if PYDANTIC_V2 else model.dict()
 def model_validate(model_cls, data):
     return model_cls.model_validate(data) if PYDANTIC_V2 else model_cls.parse_obj(data)
 
-# --- 3. 전역 애플리케이션 리소스 ---
 app_state = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """서버 시작 시 모델/키 로드"""
-    print("--- 클라이언트 백엔드 서버 시작 ---")
+    print("[ClientBackend] 서버 시작 - 모델/키 로드")
     gc.collect()
-    torch.cuda.empty_cache()
-    
-    app_state["llm_loader"] = BaseLLMLoader()
-    app_state["llm_loader"].load_model()    # LoRA Wrapped 모델 로드 및 훅 등록
-    
-    app_state["preprocessor"] = LLMPreProcessor(app_state["llm_loader"])
-    app_state["postprocessor"] = LLMPostProcessor(app_state["llm_loader"])
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    loader = BaseLLMLoader()
+    loader.load_model()
+
+    app_state["llm_loader"] = loader
+    app_state["preprocessor"] = LLMPreProcessor(loader)
+    app_state["postprocessor"] = LLMPostProcessor(loader)
     app_state["ckks_manager"] = CKKSClientManager()
-    
+
     app_state["http_session"] = requests.Session()
     app_state["server_url"] = f"http://{SERVER_HOST}:{SERVER_PORT}/compute_lora"
-    
-    print("--- 클라이언트 백엔드 준비 완료 ---")
+
+    print("[ClientBackend] 초기화 완료")
     yield
-    # --- 서버 종료 시 ---
+
     app_state["http_session"].close()
-    app_state["llm_loader"].clear_lora_hooks()  # 훅 제거
-    print("--- 클라이언트 백엔드 서버 종료 ---")
+    loader.clear_lora_hooks()
+    print("[ClientBackend] 서버 종료")
 
 app = FastAPI(lifespan=lifespan)
 
-# --- 4. API 엔드포인트 ---
 @app.post("/generate", response_model=ClientBackendResponse)
 async def generate(request: ClientBackendRequest):
-    """사용자로부터 GenerationRequest(프롬프트)를 받음"""
     start_time = time.time()
-
     try:
-        print(f"추론 요청 수신: 프롬프트 '{request.prompt[:50]}...")
+        print(f"[ClientBackend] 추론 요청: '{request.prompt[:80]}' ...")
 
-        # --- 1. 매 추론 시작 시 LoRA 가중치 0으로 리셋 ---
-        app_state["llm_loader"].reset_lora_weights()
+        loader: BaseLLMLoader = app_state["llm_loader"]
+        preproc: LLMPreProcessor = app_state["preprocessor"]
+        postproc: LLMPostProcessor = app_state["postprocessor"]
+        ckks: CKKSClientManager = app_state["ckks_manager"]
+        session: requests.Session = app_state["http_session"]
+        server_url: str = app_state["server_url"]
 
-        # --- 2. peft_model 1회 실행 → (초기 상태) xL_to_encrypt와 current_llm_hidden_state 캡처 ---
-        llm_states = app_state["preprocessor"].get_initial_states(request.prompt)
-        generated_ids = llm_states["generated_ids"][:]
+        # 매 요청마다 LoRA 가중치 0으로 초기화
+        loader.reset_lora_weights()
 
-        current_llm_hidden_state = llm_states["current_llm_hidden_state"]
-        xL_to_encrypt = llm_states["lora_xL_input"] # (Batch, Hidden)
-        
-        # --- 3. 토큰 생성 루프 ---
-        for i in range(request.max_new_tokens):
-            print(f"\n  Token {i+1}/{request.max_new_tokens}")
+        # 1) 초기 상태
+        states = preproc.get_initial_states(request.prompt)
+        generated_ids = states["generated_ids"][:]
 
-            # --- 4. 현재 xL 암호화 ---
-            print("  (>>) [Client] Hidden State 암호화 중...")
-            enc_xL_bytes = app_state["ckks_manager"].encrypt_tensor(xL_to_encrypt)
-            
-            # --- 5. 암호문 서버 전송 ---
-            print("  (>>) [Client] 서버로 암호문 전송 중...")
-            req_data = EncryptedInferenceRequest(
-                enc_hidden_state_bytes=encode_bytes_to_base64(enc_xL_bytes)
+        max_steps = request.max_new_tokens
+
+        for step in range(max_steps):
+            print(f"[ClientBackend] Token step {step + 1}/{max_steps}")
+
+            # 2) 현재 xL (1, hidden) -> (hidden,) -> 암호화
+            xL = states["lora_xL_input"]  # (1, H)
+            xL_vec = xL.squeeze(0)        # (H,)
+            enc_bytes = ckks.encrypt_tensor(xL_vec)
+
+            # 3) 서버로 전송
+            req_obj = EncryptedInferenceRequest(
+                enc_hidden_state_bytes=encode_bytes_to_base64(enc_bytes)
             )
-            server_response = app_state["http_session"].post(
-                app_state["server_url"], 
-                json=model_dump(req_data)   # Pydantic V1/V2 호환
+            res = session.post(server_url, json=model_dump(req_obj))
+            res.raise_for_status()
+            resp_obj = model_validate(EncryptedInferenceResponse, res.json())
+
+            # 4) 서버에서 계산한 LoRA delta 복호화
+            delta_bytes = decode_base64_to_bytes(resp_obj.enc_lora_delta_bytes)
+            delta_vec = ckks.decrypt_tensor(delta_bytes)  # (H,)
+            print("[CLIENT] delta norm:", delta_vec.norm().item())
+            
+            delta_tensor = delta_vec.to(DEVICE)
+
+            # 5) 델타를 전역에 설정 (hook이 사용)
+            loader.set_global_lora_output_delta(delta_tensor)
+
+            # 6) 현재 hidden state 기반으로 다음 토큰 argmax
+            next_token_id, next_token_char = postproc.integrate_lora_delta_and_predict_token(
+                states["current_llm_hidden_state"]
             )
-            server_response.raise_for_status() # 오류 시 예외 발생
-            
-            res_data = model_validate(EncryptedInferenceResponse, server_response.json())
-            
-            # --- 6. 서버로부터 LoRA 델타를 받아 복호화 ---
-            print("  (>>) [Client] LoRA 델타 복호화 중...")
-            enc_lora_output_delta_bytes = decode_base64_to_bytes(res_data.enc_lora_delta_bytes)
-            dec_lora_output_delta = app_state["ckks_manager"].decrypt_tensor(enc_lora_output_delta_bytes)
-            
-            if dec_lora_output_delta.dim() == 1:
-                dec_lora_output_delta_2D = dec_lora_output_delta.unsqueeze(0).to(DEVICE)
-            else:
-                dec_lora_output_delta_2D = dec_lora_output_delta.to(DEVICE)
-            
-            # --- 7. 훅(Hook)이 사용할 수 있도록 델타를 전역 변수에 설정
-            app.state["llm_loader"].set_global_lora_output_delta(dec_lora_output_delta_2D)
-            
-            # --- 8. current_llm_hidden_state(아직 델타 반영 x) 기반으로 다음 토큰 예측 ---
-            print("  (>>) [Client] 다음 토큰 예측 중...")
-            next_token_id, next_token_char = app_state["postprocessor"].integrate_lora_delta_and_predict_token(
-                current_llm_hidden_state=current_llm_hidden_state
-            )
-            
             generated_ids.append(next_token_id)
-            print(f"  -> 생성: '{repr(next_token_char)}", end="")
-            
-            if next_token_id == app_state["llm_loader"].eos_token_id:
-                print("\n  EOS 토큰 감지. 생성 종료.")
+
+            print(f"  -> 생성 토큰: {repr(next_token_char)}")
+
+            if next_token_id == loader.eos_token_id:
+                print("  EOS 토큰 감지, 종료.")
                 break
-            
-            # --- 9. 예측된 next_token_id로 모델 다시 실행 → 상태 업데이트 ---
-            # --- 이때 inject_delta_output_hook: (7)에서 설정한 델타 주입
-            # --- save_xL_input_hook: 다음 루프(i+1)에서 쓸 새로운 xL 캡처
-            llm_states = app_state["preprocessor"].get_next_token_states(next_token_id, llm_states)
 
-            # 델타 주입이 끝났으므로 전역 변수를 비움
-            app_state["llm_loader"].clear_global_lora_output_delta()
-            current_llm_hidden_state = llm_states["current_llm_hidden_state"]
+            # 7) LLM 상태 업데이트 (이때 hook이 delta 주입하고 새 xL 캡처)
+            states = preproc.get_next_token_states(next_token_id, states)
 
-            # (9)에서 캡처한 새 xL을 다음 루프의 암호화 대상으로 설정
-            xL_to_encrypt = llm_states["lora_xL_input"] # 새 xL (Batch, Hidden)
+            # 8) 델타 주입 완료 후 전역 delta 초기화
+            loader.clear_global_lora_output_delta()
 
-        # --- 10. 최종 결과 반환 ---
-        final_text = app_state["postprocessor"].decode_final_output(generated_ids)
-        processing_time = time.time() - start_time
+        final_text = postproc.decode_final_output(generated_ids)
+        elapsed = time.time() - start_time
+
+        print("[ClientBackend] 최종 결과:")
+        print(final_text[:500])
+        print(f"[ClientBackend] 소요 시간: {elapsed:.2f}초")
 
         return ClientBackendResponse(
             generated_text=final_text,
             status="success",
-            message=f"LLM 추론 완료. 소요 시간: {processing_time:.2f}초"
+            message=f"LLM 추론 완료 ({elapsed:.2f}초)",
         )
 
-    except HTTPException as http_exc:
-        raise http_exc
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+
 if __name__ == "__main__":
     uvicorn.run(
-        "main:app", 
+        "client_backend.main:app",
         host=CLIENT_BACKEND_HOST,
         port=CLIENT_BACKEND_PORT,
-        reload=True
+        reload=True,
     )

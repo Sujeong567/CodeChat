@@ -1,79 +1,41 @@
-# codechat/client-backend/model/postprocessing.py
+# client_backend/model/postprocessing.py
 import torch
-import torch.nn.functional as F
 
-from .base_llm import BaseLLMLoader
 from common.config import DEVICE
+from .base_llm import BaseLLMLoader
 
 class LLMPostProcessor:
-    """preprocessing가 전달한 final_hidden_state를 받아 다음 토큰 1개 예측"""
     def __init__(self, llm_loader: BaseLLMLoader):
-        """llm_loader로부터 Dtype 패치가 완료된 lm_head_weights와 final_ln_float32 모듈을 받음"""
-        self.tokenizer = llm_loader._tokenizer
+        self.tokenizer = llm_loader.tokenizer
         self.lm_head_weight, self.lm_head_bias = llm_loader.get_lm_head_weights()
         self.eos_token_id = llm_loader.eos_token_id
-        self.device = DEVICE
 
-        self.final_ln_float32 = llm_loader._find_final_layernorm(llm_loader.peft_model.base_model)
-        if self.final_ln_float32 is None:
+        self.target_device = self.lm_head_weight.device
+        self.final_ln = llm_loader._find_final_layernorm(llm_loader.peft_model.base_model)
+        if self.final_ln is not None:
+            self.final_ln = self.final_ln.to(self.target_device)
+        else:
             print("[PostProcessor] WARN: final LayerNorm을 찾지 못했습니다.")
 
     def integrate_lora_delta_and_predict_token(
         self,
-        current_llm_hidden_state: torch.Tensor, # (bfloat16)
-    ) -> tuple[int, str]:
-        
-        # 델타 주입 (bfloat16 -> float32) + (float32) = (float32)
-        normed = current_llm_hidden_state.to(torch.float32).to(self.device)
-        
-        if self.final_ln_float32 is not None:
+        current_llm_hidden_state: torch.Tensor,
+    ):
+        # hidden -> float32 -> final_ln -> lm_head -> argmax
+        h = current_llm_hidden_state.to(torch.float32).to(self.target_device)
+
+        if self.final_ln is not None:
             try:
-                # float32 텐서를 LayerNorm 모듈에 통과시킴
-                normed = self.final_ln_float32(normed)
+                h = self.final_ln(h)
             except Exception as e:
-                print(f"WARN: final LayerNorm 적용 실패: {e}")
+                print(f"[PostProcessor] WARN: final LayerNorm 적용 실패: {e}")
 
-        # float32 텐서를 LM Head 가중치와 곱함
-        final_logits = normed @ self.lm_head_weight.T + self.lm_head_bias
-
-        # argmax → 모델이 EOS 토큰을 생성하면 확실하게 EOS를 선택하도록 함
-        next_token_id = torch.argmax(final_logits, dim=-1).item()
-
-        next_token_char = self.tokenizer.decode([next_token_id], skip_special_token=False)
-        return next_token_id, next_token_char
- 
-        """
-        생성된 final_logits 중 다음 토큰 1개 선택
-        - Top-k (확률적 샘플링)
-        - argmax (결정론적 샘플링)
-            # next_token_index = torch.argmax(probabilities, dim=-1).item()
-            # next_token_char = tokenizer.decode([next_token_index], skip_special_tokens=False)
-        
-        TODO: 코드 생성 후 EOS 대신 brer...이 선택되어 랜덤값이 출력되는 것으로 보임
-                → argmax()로 변경해보기
-        
-        logits_for_softmax = final_logits / float(max(1e-6, temperature))
-        probs = F.softmax(logits_for_softmax.unsqueeze(0), dim=-1)
-        
-        if top_k is not None and top_k > 0:
-            topk_vals, topk_idx = torch.topk(probs, top_k, dim=-1)
-            topk_idx = topk_idx[0]
-            topk_vals = topk_vals[0]
-            topk_probs = topk_vals / topk_vals.sum()
-            sampled_idx = torch.multinomial(topk_probs, num_samples=1).item()
-            next_token_id = int(topk_idx[sampled_idx].item())
-        else:
-            next_token_id = torch.multinomial(probs[0], num_samples=1).item()
-
+        logits = h @ self.lm_head_weight.T + self.lm_head_bias
+        next_token_id = torch.argmax(logits, dim=-1).item()
         next_token_char = self.tokenizer.decode([next_token_id], skip_special_tokens=False)
-        
         return next_token_id, next_token_char
-        """
 
     def decode_final_output(self, generated_ids: list) -> str:
-        """디코딩"""
-        final_output_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        response_start_tag = "### Response:\n"
-        if response_start_tag in final_output_text:
-            return final_output_text.split(response_start_tag)[1].strip()
-        return final_output_text
+        text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        # 실험 중이면 그냥 전체를 반환
+        return text
