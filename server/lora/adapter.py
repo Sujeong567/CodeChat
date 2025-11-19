@@ -100,3 +100,26 @@ def get_fhe_lora_tensors(lora_path: str = None):
             results[module_name] = (W_A_pt, W_B_pt)
 
         return results
+
+def load_all_lora_tensors(lora_path: str = None):
+    """
+    q_proj, k_proj, v_proj, o_proj 각각의 LoRA 행렬을 읽어
+    plain_tensor로 변환 후 dict로 반환한다.
+    """
+    lora_data = load_lora_adapter(lora_path)
+    weights = lora_data["weights"]
+
+    modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    proj_tensors = {}
+
+    for proj in modules:
+        layer_name = f"model.layers.{TARGET_LAYER_INDEX}.self_attn.{proj}"
+        W_A, W_B = extract_lora_matrices(weights, layer_name)
+
+        W_A_pt = ts.plain_tensor(W_A.T.float().tolist())
+        W_B_pt = ts.plain_tensor(W_B.T.float().tolist())
+
+        proj_tensors[proj] = (W_A_pt, W_B_pt)
+
+    print("[Adapter] 모든 proj에 대한 TenSEAL PlainTensor 변환 완료.")
+    return proj_tensors

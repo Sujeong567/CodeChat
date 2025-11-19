@@ -32,6 +32,7 @@ app_state = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[Server] 엔터프라이즈 서버 시작")
+
     ctx = load_server_context()
     app_state["he_context"] = ctx
 
@@ -39,8 +40,12 @@ async def lifespan(app: FastAPI):
     if HIDDEN_SIZE > max_slots:
         print(f"[Server] 경고: HiddenSize={HIDDEN_SIZE}, HE 슬롯={max_slots}")
 
-    lora_tensors = get_fhe_lora_tensors()
-    app_state["lora_tensors"] = lora_tensors
+    # 🔥 모든 proj(q,k,v,o) 로딩
+    from server.lora.adapter import load_all_lora_tensors
+    proj_tensors = load_all_lora_tensors()
+
+    # 🔥 서버에서 쓸 dictionary로 저장
+    app_state["proj_tensors"] = proj_tensors
 
     print("[Server] 준비 완료")
     yield
@@ -52,27 +57,29 @@ app = FastAPI(lifespan=lifespan)
 async def compute_lora(request: EncryptedInferenceRequest):
     try:
         ctx: ts.Context = app_state["he_context"]
-        lora_tensors = app_state["lora_tensors"]
+        proj_tensors = app_state["proj_tensors"]   # 🔥 여기서 오류 나던 부분
 
+        # Base64 → bytes → CKKSVector
         enc_bytes = decode_base64_to_bytes(request.enc_hidden_state_bytes)
         enc_vec = ts.ckks_vector_from(ctx, enc_bytes)
 
-        # 4개 proj에 대한 FHE LoRA 연산
-        delta_dict = he_lora_inference(enc_vec, lora_tensors, ctx)
+        # 🔥 4개 proj 각각 계산
+        from server.lora.inference import he_lora_inference_multi
 
-        return EncryptedInferenceResponse(
-            enc_lora_delta_q_proj=encode_bytes_to_base64(delta_dict["q_proj"]),
-            enc_lora_delta_k_proj=encode_bytes_to_base64(delta_dict["k_proj"]),
-            enc_lora_delta_v_proj=encode_bytes_to_base64(delta_dict["v_proj"]),
-            enc_lora_delta_o_proj=encode_bytes_to_base64(delta_dict["o_proj"]),
+        enc_deltas = he_lora_inference_multi(enc_vec, proj_tensors, ctx)
+
+        resp = EncryptedInferenceResponse(
+            enc_q_delta_bytes = encode_bytes_to_base64(enc_deltas["q_proj"]),
+            enc_k_delta_bytes = encode_bytes_to_base64(enc_deltas["k_proj"]),
+            enc_v_delta_bytes = encode_bytes_to_base64(enc_deltas["v_proj"]),
+            enc_o_delta_bytes = encode_bytes_to_base64(enc_deltas["o_proj"]),
         )
-
+        return resp
 
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
 
 if __name__ == "__main__":
     uvicorn.run(

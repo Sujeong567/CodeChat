@@ -13,6 +13,7 @@ python_cache/
 *.bin
 *.pt
 *.pth
+*.zip
 model-*-of-*.safetensors
 model.safetensors
 

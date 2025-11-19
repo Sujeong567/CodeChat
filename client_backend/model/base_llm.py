@@ -17,7 +17,7 @@ from common.config import (
 from common.model_utils import get_bnb_config, get_lora_config
 
 # proj별 델타를 관리하는 전역 dict
-GLOBAL_INJECTED_LORA_OUTPUT_DELTA = {}
+GLOBAL_INJECTED_LORA_OUTPUT_DELTAS = {}
 
 
 class BaseLLMLoader:

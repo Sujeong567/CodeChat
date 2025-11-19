@@ -1,37 +1,20 @@
 # server/lora/inference.py
 import tenseal as ts
 
-def he_lora_inference(enc_input: ts.CKKSVector, lora_tensors: dict, ctx: ts.Context) -> dict:
-    """
-    enc_input: CKKSVector (길이 = HIDDEN_SIZE)
-    lora_tensors: {
-        "q_proj": (W_A_pt, W_B_pt),
-        "k_proj": (W_A_pt, W_B_pt),
-        "v_proj": (W_A_pt, W_B_pt),
-        "o_proj": (W_A_pt, W_B_pt)
-    }
+def he_lora_inference(enc_input, W_A_pt, W_B_pt, ctx):
+    enc_intermediate = enc_input.matmul(W_A_pt)
+    enc_output = enc_intermediate.matmul(W_B_pt)
+    try:
+        enc_output.rescale_()
+    except:
+        pass
+    return enc_output.serialize()
 
-    return:
-    {
-        "q_proj": serialized_bytes,
-        "k_proj": serialized_bytes,
-        ...
-    }
-    """
-    print("[Server] FHE LoRA 연산 시작 (multi-proj)")
+
+def he_lora_inference_multi(enc_input, proj_tensors, ctx):
     results = {}
 
-    for name, (W_A_pt, W_B_pt) in lora_tensors.items():
-        # enc_input: (H)
-        enc_intermediate = enc_input.matmul(W_A_pt)   # (r)
-        enc_delta = enc_intermediate.matmul(W_B_pt)   # (H)
+    for proj, (W_A_pt, W_B_pt) in proj_tensors.items():
+        results[proj] = he_lora_inference(enc_input, W_A_pt, W_B_pt, ctx)
 
-        try:
-            enc_delta.rescale_()
-        except Exception:
-            pass
-
-        results[name] = enc_delta.serialize()
-
-    print("[Server] FHE LoRA 연산 완료 (multi-proj)")
     return results
