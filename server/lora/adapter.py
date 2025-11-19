@@ -1,14 +1,13 @@
 # server/lora/adapter.py
 import torch
 import json
-import os
 from pathlib import Path
 from safetensors.torch import load_file
 import tenseal as ts
 
 from common.config import (
     LORA_WEIGHTS_DIR, R_RANK, HIDDEN_SIZE,
-    TARGET_LAYER_INDEX, REPRESENTATIVE_LORA_TARGET_MODULE
+    TARGET_LAYER_INDEX
 )
 
 def load_lora_adapter(lora_path: str = None):
@@ -23,103 +22,50 @@ def load_lora_adapter(lora_path: str = None):
         config = json.load(f)
 
     weights = load_file(str(adapter_file))
-    rank = config.get("r", R_RANK)
-    alpha = config.get("lora_alpha", 32)
+    return weights, config
 
-    return {
-        "weights": weights,
-        "config": config,
-        "rank": rank,
-        "alpha": alpha,
-    }
 
-def extract_lora_matrices(weights: dict, layer_name: str):
-    lora_A_key = None
-    lora_B_key = None
+def get_layer_prefix(layer_idx: int):
+    # 실제 key prefix
+    # base_model.model.model.layers.{L}.self_attn.
+    return f"base_model.model.model.layers.{layer_idx}.self_attn."
 
-    for key in weights.keys():
-        if layer_name in key:
-            if "lora_A" in key:
-                lora_A_key = key
-            elif "lora_B" in key:
-                lora_B_key = key
 
-    if lora_A_key is None or lora_B_key is None:
-        raise ValueError(f"Layer '{layer_name}'의 LoRA 행렬을 찾을 수 없습니다.")
+def extract_lora_for_proj(weights, layer_idx, proj_name):
+    """
+    proj_name: q_proj / k_proj / v_proj / o_proj
+    """
 
-    W_A = weights[lora_A_key].float()   # (r, hidden)
-    W_B = weights[lora_B_key].float()   # (hidden, r)
+    prefix = get_layer_prefix(layer_idx)
+    key_A = f"{prefix}{proj_name}.lora_A.weight"
+    key_B = f"{prefix}{proj_name}.lora_B.weight"
 
-    print(f"[Adapter] 레이어: {layer_name}")
-    print(f"         W_A: {W_A.shape}, W_B: {W_B.shape}")
+    if key_A not in weights or key_B not in weights:
+        raise KeyError(f"Missing LoRA keys: {key_A} or {key_B}")
 
+    W_A = weights[key_A].float()    # (r, hidden)
+    W_B = weights[key_B].float()    # (hidden, r)
+
+    print(f"[Adapter] Loaded {proj_name}: W_A={W_A.shape}, W_B={W_B.shape}")
     return W_A, W_B
 
-def get_fhe_lora_tensors(lora_path: str = None):
-    """
-    return:
-    {
-        "q_proj": (W_A_pt, W_B_pt),
-        "k_proj": (W_A_pt, W_B_pt),
-        "v_proj": (W_A_pt, W_B_pt),
-        "o_proj": (W_A_pt, W_B_pt)
-    }
-    """
-    TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
-    results = {}
-
-    try:
-        lora_data = load_lora_adapter(lora_path)
-        weights = lora_data["weights"]
-
-        for module_name in TARGET_MODULES:
-            layer_key = f"model.layers.{TARGET_LAYER_INDEX}.self_attn.{module_name}"
-            W_A, W_B = extract_lora_matrices(weights, layer_key)
-
-            # (r, hidden) → transpose → (hidden, r)
-            W_A_pt = ts.plain_tensor(W_A.T.float().tolist())  
-            W_B_pt = ts.plain_tensor(W_B.T.float().tolist())
-
-            results[module_name] = (W_A_pt, W_B_pt)
-
-        print("[Adapter] 모든 proj에 대한 TenSEAL PlainTensor 변환 완료.")
-        return results
-
-    except Exception as e:
-        print(f"[Adapter] 가중치 준비 실패: {e}")
-        print("[Adapter] 0 텐서 4개 모두 대체합니다.")
-
-        results = {}
-        for module_name in TARGET_MODULES:
-            W_A = torch.zeros(R_RANK, HIDDEN_SIZE).float()
-            W_B = torch.zeros(HIDDEN_SIZE, R_RANK).float()
-
-            W_A_pt = ts.plain_tensor(W_A.T.tolist())
-            W_B_pt = ts.plain_tensor(W_B.T.tolist())
-
-            results[module_name] = (W_A_pt, W_B_pt)
-
-        return results
 
 def load_all_lora_tensors(lora_path: str = None):
-    """
-    q_proj, k_proj, v_proj, o_proj 각각의 LoRA 행렬을 읽어
-    plain_tensor로 변환 후 dict로 반환한다.
-    """
-    lora_data = load_lora_adapter(lora_path)
-    weights = lora_data["weights"]
+    weights, config = load_lora_adapter(lora_path)
 
-    modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
-    proj_tensors = {}
+    layer_idx = TARGET_LAYER_INDEX
+    proj_names = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-    for proj in modules:
-        layer_name = f"model.layers.{TARGET_LAYER_INDEX}.self_attn.{proj}"
-        W_A, W_B = extract_lora_matrices(weights, layer_name)
+    proj_dict = {}
 
-        W_A_pt = ts.plain_tensor(W_A.T.float().tolist())
-        W_B_pt = ts.plain_tensor(W_B.T.float().tolist())
+    for proj in proj_names:
+        W_A, W_B = extract_lora_for_proj(weights, layer_idx, proj)
 
-        proj_tensors[proj] = (W_A_pt, W_B_pt)
+        # transpose: (r, hidden) → (hidden, r)
+        W_A_pt = ts.plain_tensor(W_A.T.tolist())
+        W_B_pt = ts.plain_tensor(W_B.T.tolist())
+
+        proj_dict[proj] = (W_A_pt, W_B_pt)
 
     print("[Adapter] 모든 proj에 대한 TenSEAL PlainTensor 변환 완료.")
-    return proj_tensors
+    return proj_dict
