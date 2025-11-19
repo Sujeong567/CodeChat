@@ -7,10 +7,7 @@ class EncryptedInferenceRequest(BaseModel):
 
 
 class EncryptedInferenceResponse(BaseModel):
-    enc_q_delta_bytes: str
-    enc_k_delta_bytes: str
-    enc_v_delta_bytes: str
-    enc_o_delta_bytes: str
+    enc_lora_delta_bytes: str
 
 
 class ClientBackendRequest(BaseModel):

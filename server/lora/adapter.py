@@ -7,7 +7,7 @@ import tenseal as ts
 
 from common.config import (
     LORA_WEIGHTS_DIR, R_RANK, HIDDEN_SIZE,
-    TARGET_LAYER_INDEX
+    TARGET_LAYER_INDEX, REPRESENTATIVE_LORA_TARGET_MODULE,
 )
 
 def load_lora_adapter(lora_path: str = None):
@@ -22,50 +22,64 @@ def load_lora_adapter(lora_path: str = None):
         config = json.load(f)
 
     weights = load_file(str(adapter_file))
-    return weights, config
+    rank = config.get("r", R_RANK)
+    alpha = config.get("lora_alpha", 32)
 
+    return {
+        "weights": weights,
+        "config": config,
+        "rank": rank,
+        "alpha": alpha,
+    }
 
-def get_layer_prefix(layer_idx: int):
-    # 실제 key prefix
-    # base_model.model.model.layers.{L}.self_attn.
-    return f"base_model.model.model.layers.{layer_idx}.self_attn."
+def extract_lora_matrices(weights: dict, layer_name: str):
+    lora_A_key = None
+    lora_B_key = None
 
+    for key in weights.keys():
+        if layer_name in key:
+            if "lora_A" in key:
+                lora_A_key = key
+            elif "lora_B" in key:
+                lora_B_key = key
 
-def extract_lora_for_proj(weights, layer_idx, proj_name):
-    """
-    proj_name: q_proj / k_proj / v_proj / o_proj
-    """
+    if lora_A_key is None or lora_B_key is None:
+        raise ValueError(f"Layer '{layer_name}'의 LoRA 행렬을 찾을 수 없습니다.")
 
-    prefix = get_layer_prefix(layer_idx)
-    key_A = f"{prefix}{proj_name}.lora_A.weight"
-    key_B = f"{prefix}{proj_name}.lora_B.weight"
+    # (r, hidden), (hidden, r)
+    W_A = weights[lora_A_key].float()
+    W_B = weights[lora_B_key].float()
 
-    if key_A not in weights or key_B not in weights:
-        raise KeyError(f"Missing LoRA keys: {key_A} or {key_B}")
+    print(f"[Adapter] 레이어: {layer_name}")
+    print(f"         W_A: {W_A.shape}, W_B: {W_B.shape}")
 
-    W_A = weights[key_A].float()    # (r, hidden)
-    W_B = weights[key_B].float()    # (hidden, r)
-
-    print(f"[Adapter] Loaded {proj_name}: W_A={W_A.shape}, W_B={W_B.shape}")
     return W_A, W_B
 
+def get_fhe_lora_tensors(lora_path: str = None):
+    """
+    q_proj 하나에 대해서만 (hidden, r), (r, hidden)을 plain_tensor로 반환
+    """
+    try:
+        lora_data = load_lora_adapter(lora_path)
+        weights = lora_data["weights"]
 
-def load_all_lora_tensors(lora_path: str = None):
-    weights, config = load_lora_adapter(lora_path)
+        # ex) model.layers.0.self_attn.q_proj
+        layer_name = f"base_model.model.model.layers.{TARGET_LAYER_INDEX}.self_attn.{REPRESENTATIVE_LORA_TARGET_MODULE}"
+        W_A, W_B = extract_lora_matrices(weights, layer_name)
 
-    layer_idx = TARGET_LAYER_INDEX
-    proj_names = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        # (r, hidden) -> (hidden, r)
+        W_A_pt = ts.plain_tensor(W_A.T.float().tolist())
+        W_B_pt = ts.plain_tensor(W_B.T.float().tolist())
 
-    proj_dict = {}
+        print("[Adapter] q_proj에 대한 TenSEAL PlainTensor 변환 완료.")
+        return W_A_pt, W_B_pt
 
-    for proj in proj_names:
-        W_A, W_B = extract_lora_for_proj(weights, layer_idx, proj)
+    except Exception as e:
+        print(f"[Adapter] 가중치 준비 실패: {e}")
+        print("[Adapter] 0 텐서로 대체합니다.")
 
-        # transpose: (r, hidden) → (hidden, r)
+        W_A = torch.zeros(R_RANK, HIDDEN_SIZE).float()
+        W_B = torch.zeros(HIDDEN_SIZE, R_RANK).float()
         W_A_pt = ts.plain_tensor(W_A.T.tolist())
         W_B_pt = ts.plain_tensor(W_B.T.tolist())
-
-        proj_dict[proj] = (W_A_pt, W_B_pt)
-
-    print("[Adapter] 모든 proj에 대한 TenSEAL PlainTensor 변환 완료.")
-    return proj_dict
+        return W_A_pt, W_B_pt

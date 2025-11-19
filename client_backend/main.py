@@ -109,25 +109,13 @@ async def generate(request: ClientBackendRequest):
             resp_obj = model_validate(EncryptedInferenceResponse, res.json())
 
             # 4) 서버에서 계산한 LoRA delta 복호화
-            delta_q_bytes = decode_base64_to_bytes(resp_obj.enc_q_delta_bytes)
-            delta_k_bytes = decode_base64_to_bytes(resp_obj.enc_k_delta_bytes)
-            delta_v_bytes = decode_base64_to_bytes(resp_obj.enc_v_delta_bytes)
-            delta_o_bytes = decode_base64_to_bytes(resp_obj.enc_o_delta_bytes)
+            delta_bytes = decode_base64_to_bytes(resp_obj.enc_lora_delta_bytes)
+            delta_vec = ckks.decrypt_tensor(delta_bytes)  # (H,)
+            delta_tensor = delta_vec.unsqueeze(0).to(DEVICE)  # (1, H)
 
-            delta_q_vec = ckks.decrypt_tensor(delta_q_bytes)
-            delta_k_vec = ckks.decrypt_tensor(delta_k_bytes)
-            delta_v_vec = ckks.decrypt_tensor(delta_v_bytes)
-            delta_o_vec = ckks.decrypt_tensor(delta_o_bytes)
+            # 5) 델타를 전역에 설정 (hook이 사용)
+            loader.set_global_lora_output_delta(delta_tensor)
 
-            delta_tensors = {
-                "q_proj": delta_q_vec.unsqueeze(0).to(DEVICE),
-                "k_proj": delta_k_vec.unsqueeze(0).to(DEVICE),
-                "v_proj": delta_v_vec.unsqueeze(0).to(DEVICE),
-                "o_proj": delta_o_vec.unsqueeze(0).to(DEVICE),
-            }
-
-            # 5) 여러 delta를 hook에 전달
-            loader.set_global_lora_output_deltas(delta_tensors)
 
             # 6) 현재 hidden state 기반으로 다음 토큰 argmax
             next_token_id, next_token_char = postproc.integrate_lora_delta_and_predict_token(
@@ -145,7 +133,7 @@ async def generate(request: ClientBackendRequest):
             states = preproc.get_next_token_states(next_token_id, states)
 
             # 8) 델타 주입 완료 후 전역 delta 초기화
-            loader.clear_global_lora_output_deltas()
+            loader.clear_global_lora_output_delta()
 
         final_text = postproc.decode_final_output(generated_ids)
         elapsed = time.time() - start_time

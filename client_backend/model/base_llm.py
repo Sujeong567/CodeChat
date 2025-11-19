@@ -16,8 +16,7 @@ from common.config import (
 )
 from common.model_utils import get_bnb_config, get_lora_config
 
-# proj별 델타를 관리하는 전역 dict
-GLOBAL_INJECTED_LORA_OUTPUT_DELTAS = {}
+GLOBAL_INJECTED_LORA_OUTPUT_DELTA = None
 
 
 class BaseLLMLoader:
@@ -134,69 +133,57 @@ class BaseLLMLoader:
 
     def _register_lora_hooks(self):
         """
-        하나의 레이어(TARGET_LAYER_INDEX)의 self_attn.{q,k,v,o}_proj에 대해 hook 등록.
-        - q_proj: x_L 캡처 + delta 주입
-        - k/v/o_proj: delta 주입만
+        단일 representative LoRA 모듈 (예: model.layers.0.self_attn.q_proj)에만 hook 등록
         """
         self.clear_lora_hooks()
 
-        TARGET_LAYER = TARGET_LAYER_INDEX
-        TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        target_layer = TARGET_LAYER_INDEX
+        target_module = REPRESENTATIVE_LORA_TARGET_MODULE  # "q_proj"
+        target_signature = f"model.layers.{target_layer}.self_attn.{target_module}"
 
         def save_xL_input_hook(module, args):
-            # args[0]: (batch, seq, hidden)
+            # args[0]: 입력 hidden state (B, T, H) 또는 (B, H)
             x = args[0]
-            last_token_input = x[:, -1, :].detach().clone()
+            if x.dim() == 3:
+                last_token_input = x[:, -1, :].detach().clone()
+            else:
+                last_token_input = x.detach().clone()
             self._lora_xL_inputs_queue.append(last_token_input)
             print(f"[HOOK] xL captured: {last_token_input.shape}")
 
-        def make_inject_delta_hook(proj_key: str):
-            def _inject(module, input, output):
-                global GLOBAL_INJECTED_LORA_OUTPUT_DELTAS
-                delta = GLOBAL_INJECTED_LORA_OUTPUT_DELTAS.get(proj_key)
-                if delta is None:
-                    return output
+        def inject_delta_output_hook(module, input, output):
+            global GLOBAL_INJECTED_LORA_OUTPUT_DELTA
+            if GLOBAL_INJECTED_LORA_OUTPUT_DELTA is None:
+                return output
 
-                # delta: (H,) 또는 (1, H) 허용
-                if delta.dim() == 2 and delta.shape[0] == 1:
-                    delta_use = delta[0]
-                else:
-                    delta_use = delta
-
-                if delta_use.shape[-1] != output.shape[-1]:
+            delta = GLOBAL_INJECTED_LORA_OUTPUT_DELTA  # (1, H) 기대
+            # output: (B, T, H) 또는 (B, H)
+            if output.dim() == 3:
+                if delta.shape[-1] != output.shape[-1]:
                     print(
-                        f"[DELTA] Skip {proj_key}: delta={delta_use.shape}, output={output.shape}"
+                        f"[WARN] Skip delta injection: delta={delta.shape}, output={output.shape}"
                     )
                     return output
-
-                out = output.clone()
-                out[:, -1, :] = out[:, -1, :] + delta_use.to(out.dtype)
-                print(
-                    f"[DELTA] Injected delta for {proj_key} at module={module.__class__.__name__}, "
-                    f"delta_shape={delta_use.shape}, output_shape={out.shape}"
-                )
-                return out
-
-            return _inject
+                output[:, -1, :] = output[:, -1, :] + delta.to(output.dtype)
+            elif output.dim() == 2:
+                if delta.shape[-1] != output.shape[-1]:
+                    print(
+                        f"[WARN] Skip delta injection: delta={delta.shape}, output={output.shape}"
+                    )
+                    return output
+                output[:, :] = output[:, :] + delta.to(output.dtype)
+            else:
+                print(f"[WARN] Unexpected output dim: {output.shape}")
+            return output
 
         for name, module in self._peft_model.named_modules():
-            if not isinstance(module, LoraLayer):
-                continue
-            if f".layers.{TARGET_LAYER}.self_attn." not in name:
-                continue
-
-            for proj_key in TARGET_MODULES:
-                if f".self_attn.{proj_key}" in name:
-                    # q_proj 하나에서만 x_L 캡처
-                    if proj_key == "q_proj":
-                        pre_hook = module.register_forward_pre_hook(save_xL_input_hook)
-                        self._xL_pre_hooks.append(pre_hook)
-
-                    hook = module.register_forward_hook(make_inject_delta_hook(proj_key))
-                    self._output_post_hooks.append(hook)
-
-                    print(f"[HOOK] Registered hooks at: {name} ({proj_key})")
-                    break
+            if isinstance(module, LoraLayer) and target_signature in name:
+                pre_hook = module.register_forward_pre_hook(save_xL_input_hook)
+                post_hook = module.register_forward_hook(inject_delta_output_hook)
+                self._xL_pre_hooks.append(pre_hook)
+                self._output_post_hooks.append(post_hook)
+                print(f"[HOOK] Registered hooks at: {name}")
+                break  # 하나만!
 
 
     def clear_lora_hooks(self):
@@ -219,23 +206,20 @@ class BaseLLMLoader:
             raise RuntimeError("캡처된 xL 입력이 없습니다.")
         return self._lora_xL_inputs_queue.popleft()
 
-    def set_global_lora_output_deltas(self, delta_dict: dict):
+    def set_global_lora_output_delta(self, delta: torch.Tensor):
         """
-        delta_dict: {"q_proj": tensor(1, H), ...}
+        delta: (1, H) 형태 텐서
         """
-        global GLOBAL_INJECTED_LORA_OUTPUT_DELTAS
-        GLOBAL_INJECTED_LORA_OUTPUT_DELTAS = {}
-        for k, v in delta_dict.items():
-            GLOBAL_INJECTED_LORA_OUTPUT_DELTAS[k] = v.detach().to(torch.float32)
+        global GLOBAL_INJECTED_LORA_OUTPUT_DELTA
+        GLOBAL_INJECTED_LORA_OUTPUT_DELTA = delta
+        print(f"[BaseLLM] Global LoRA delta set: {tuple(delta.shape)}")
 
-        keys = ", ".join(
-            f"{k}:{tuple(v.shape)}" for k, v in GLOBAL_INJECTED_LORA_OUTPUT_DELTAS.items()
-        )
-        print(f"[BaseLLM] Global LoRA deltas set: {keys}")
 
-    def clear_global_lora_output_deltas(self):
-        global GLOBAL_INJECTED_LORA_OUTPUT_DELTAS
-        GLOBAL_INJECTED_LORA_OUTPUT_DELTAS.clear()
+    def clear_global_lora_output_delta(self):
+        global GLOBAL_INJECTED_LORA_OUTPUT_DELTA
+        GLOBAL_INJECTED_LORA_OUTPUT_DELTA = None
+        print("[BaseLLM] Cleared global LoRA delta")
+
 
     # ------------------------------------------------------------------
     #  프로퍼티 / LM Head 가중치
