@@ -139,7 +139,7 @@ class BaseLLMLoader:
 
         target_layer = TARGET_LAYER_INDEX
         target_module = REPRESENTATIVE_LORA_TARGET_MODULE  # "q_proj"
-        target_signature = f"model.layers.{target_layer}.self_attn.{target_module}"
+        target_signature = f"base_model.model.model.layers.{target_layer}.self_attn.{target_module}"
 
         def save_xL_input_hook(module, args):
             # args[0]: 입력 hidden state (B, T, H) 또는 (B, H)
@@ -156,7 +156,21 @@ class BaseLLMLoader:
             if GLOBAL_INJECTED_LORA_OUTPUT_DELTA is None:
                 return output
 
+            name = module.__class__.__qualname__
+            full_name = module.__dict__.get('_forward_module', None)
+
+            module_path = ""
+            for n, m in self._peft_model.named_modules():
+                if m is module:
+                    module_path = n
+                    break
+
+            if "q_proj" not in module_path:
+                # q_proj가 아닌 경우는 delta injection 하지 않음
+                return output
+
             delta = GLOBAL_INJECTED_LORA_OUTPUT_DELTA  # (1, H) 기대
+
             # output: (B, T, H) 또는 (B, H)
             if output.dim() == 3:
                 if delta.shape[-1] != output.shape[-1]:
@@ -165,6 +179,8 @@ class BaseLLMLoader:
                     )
                     return output
                 output[:, -1, :] = output[:, -1, :] + delta.to(output.dtype)
+                print(f"[DELTA] Injected delta for q_proj at module={module_path}")
+
             elif output.dim() == 2:
                 if delta.shape[-1] != output.shape[-1]:
                     print(
@@ -172,6 +188,8 @@ class BaseLLMLoader:
                     )
                     return output
                 output[:, :] = output[:, :] + delta.to(output.dtype)
+                print(f"[DELTA] Injected delta for q_proj at module={module_path}")
+                
             else:
                 print(f"[WARN] Unexpected output dim: {output.shape}")
             return output
@@ -183,7 +201,7 @@ class BaseLLMLoader:
                 self._xL_pre_hooks.append(pre_hook)
                 self._output_post_hooks.append(post_hook)
                 print(f"[HOOK] Registered hooks at: {name}")
-                break  # 하나만!
+                break
 
 
     def clear_lora_hooks(self):

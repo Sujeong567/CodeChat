@@ -38,7 +38,7 @@ LORA_WEIGHTS_DIR = os.path.join(
 )
 
 # 어떤 레이어의 q_proj 입력을 캡처할지
-TARGET_LAYER_INDEX = 0
+TARGET_LAYER_INDEX = 15
 REPRESENTATIVE_LORA_TARGET_MODULE = "q_proj"
 LORA_INJECTION_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
