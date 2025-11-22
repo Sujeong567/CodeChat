@@ -133,75 +133,52 @@ class BaseLLMLoader:
 
     def _register_lora_hooks(self):
         """
-        단일 representative LoRA 모듈 (예: model.layers.0.self_attn.q_proj)에만 hook 등록
+        기존에는 단일 representative q_proj에만 hook을 달았지만,
+        이제는 모든 레이어 × 모든 LoRA 모듈(q,k,v,o)에 hook을 달아야 함
         """
         self.clear_lora_hooks()
 
-        target_layer = TARGET_LAYER_INDEX
-        target_module = REPRESENTATIVE_LORA_TARGET_MODULE  # "q_proj"
-        target_signature = f"base_model.model.model.layers.{target_layer}.self_attn.{target_module}"
+        print("[HOOK] Registering hooks for ALL LoRA layers")
 
-        def save_xL_input_hook(module, args):
-            # args[0]: 입력 hidden state (B, T, H) 또는 (B, H)
-            x = args[0]
-            if x.dim() == 3:
-                last_token_input = x[:, -1, :].detach().clone()
-            else:
-                last_token_input = x.detach().clone()
-            self._lora_xL_inputs_queue.append(last_token_input)
-            print(f"[HOOK] xL captured: {last_token_input.shape}")
-
-        def inject_delta_output_hook(module, input, output):
-            global GLOBAL_INJECTED_LORA_OUTPUT_DELTA
-            if GLOBAL_INJECTED_LORA_OUTPUT_DELTA is None:
-                return output
-
-            name = module.__class__.__qualname__
-            full_name = module.__dict__.get('_forward_module', None)
-
-            module_path = ""
-            for n, m in self._peft_model.named_modules():
-                if m is module:
-                    module_path = n
-                    break
-
-            if "q_proj" not in module_path:
-                # q_proj가 아닌 경우는 delta injection 하지 않음
-                return output
-
-            delta = GLOBAL_INJECTED_LORA_OUTPUT_DELTA  # (1, H) 기대
-
-            # output: (B, T, H) 또는 (B, H)
-            if output.dim() == 3:
-                if delta.shape[-1] != output.shape[-1]:
-                    print(
-                        f"[WARN] Skip delta injection: delta={delta.shape}, output={output.shape}"
-                    )
-                    return output
-                output[:, -1, :] = output[:, -1, :] + delta.to(output.dtype)
-                print(f"[DELTA] Injected delta for q_proj at module={module_path}")
-
-            elif output.dim() == 2:
-                if delta.shape[-1] != output.shape[-1]:
-                    print(
-                        f"[WARN] Skip delta injection: delta={delta.shape}, output={output.shape}"
-                    )
-                    return output
-                output[:, :] = output[:, :] + delta.to(output.dtype)
-                print(f"[DELTA] Injected delta for q_proj at module={module_path}")
+        for module_path, module in self._peft_model.named_modules():
+            # LoraLayer만 대상
+            if isinstance(module, LoraLayer):
                 
-            else:
-                print(f"[WARN] Unexpected output dim: {output.shape}")
-            return output
+                # q_proj, k_proj, v_proj, o_proj 중 하나인지 확인
+                if not any(p in module_path for p in ["q_proj", "k_proj", "v_proj", "o_proj"]):
+                    continue
 
-        for name, module in self._peft_model.named_modules():
-            if isinstance(module, LoraLayer) and target_signature in name:
-                pre_hook = module.register_forward_pre_hook(save_xL_input_hook)
-                post_hook = module.register_forward_hook(inject_delta_output_hook)
+                # pre-hook: xL capture (마지막 토큰)
+                pre_hook = module.register_forward_pre_hook(
+                    lambda m, args: self._lora_xL_inputs_queue.append(
+                        (args[0][:, -1, :] if args[0].dim() == 3 else args[0].detach().clone())
+                    )
+                )
+
+                # post-hook: delta injection
+                def inject_delta(module, input, output, module_path=module_path):
+                    global GLOBAL_INJECTED_LORA_OUTPUT_DELTA
+                    if GLOBAL_INJECTED_LORA_OUTPUT_DELTA is None:
+                        return output
+
+                    delta = GLOBAL_INJECTED_LORA_OUTPUT_DELTA
+
+                    # output shape (B,T,H) 또는 (B,H)
+                    if output.dim() == 3:
+                        output[:, -1, :] += delta.to(output.dtype)
+                    elif output.dim() == 2:
+                        output[:, :] += delta.to(output.dtype)
+
+                    print(f"[DELTA] Injected delta into {module_path}")
+                    return output
+
+                post_hook = module.register_forward_hook(inject_delta)
+
                 self._xL_pre_hooks.append(pre_hook)
                 self._output_post_hooks.append(post_hook)
-                print(f"[HOOK] Registered hooks at: {name}")
-                break
+
+                print(f"[HOOK] Registered hooks at: {module_path}")
+
 
 
     def clear_lora_hooks(self):
