@@ -55,31 +55,53 @@ def extract_lora_matrices(weights: dict, layer_name: str):
 
     return W_A, W_B
 
-def get_fhe_lora_tensors(lora_path: str = None):
+N_LAYERS = 32  # 필요하면 config 에 넣어도 됨
+
+def get_multi_layer_qproj_tensors(lora_path: str = None):
     """
-    q_proj 하나에 대해서만 (hidden, r), (r, hidden)을 plain_tensor로 반환
+    0~31 모든 layer의 q_proj에 대해
+    (hidden, r), (r, hidden) plain_tensor를 dict로 반환
+    return:
+        {
+          layer_idx: (W_A_pt, W_B_pt),
+          ...
+        }
     """
     try:
         lora_data = load_lora_adapter(lora_path)
         weights = lora_data["weights"]
 
-        # ex) model.layers.0.self_attn.q_proj
-        layer_name = f"base_model.model.model.layers.{TARGET_LAYER_INDEX}.self_attn.{REPRESENTATIVE_LORA_TARGET_MODULE}"
-        W_A, W_B = extract_lora_matrices(weights, layer_name)
+        layer_tensors = {}
 
-        # (r, hidden) -> (hidden, r)
-        W_A_pt = ts.plain_tensor(W_A.T.float().tolist())
-        W_B_pt = ts.plain_tensor(W_B.T.float().tolist())
+        for layer_idx in range(N_LAYERS):
+            layer_name = (
+                f"base_model.model.model.layers.{layer_idx}.self_attn."
+                f"{REPRESENTATIVE_LORA_TARGET_MODULE}"  # "q_proj"
+            )
+            W_A, W_B = extract_lora_matrices(weights, layer_name)
 
-        print("[Adapter] q_proj에 대한 TenSEAL PlainTensor 변환 완료.")
-        return W_A_pt, W_B_pt
+            # (r, hidden) -> (hidden, r)
+            W_A_pt = ts.plain_tensor(W_A.T.float().tolist())
+            W_B_pt = ts.plain_tensor(W_B.T.float().tolist())
+
+            layer_tensors[layer_idx] = (W_A_pt, W_B_pt)
+
+        print(
+            f"[Adapter] 모든 layer q_proj에 대한 TenSEAL PlainTensor 변환 완료. "
+            f"총 개수 = {len(layer_tensors)}"
+        )
+        return layer_tensors
 
     except Exception as e:
         print(f"[Adapter] 가중치 준비 실패: {e}")
         print("[Adapter] 0 텐서로 대체합니다.")
 
-        W_A = torch.zeros(R_RANK, HIDDEN_SIZE).float()
-        W_B = torch.zeros(HIDDEN_SIZE, R_RANK).float()
-        W_A_pt = ts.plain_tensor(W_A.T.tolist())
-        W_B_pt = ts.plain_tensor(W_B.T.tolist())
-        return W_A_pt, W_B_pt
+        layer_tensors = {}
+        for layer_idx in range(N_LAYERS):
+            W_A = torch.zeros(R_RANK, HIDDEN_SIZE).float()
+            W_B = torch.zeros(HIDDEN_SIZE, R_RANK).float()
+            W_A_pt = ts.plain_tensor(W_A.T.tolist())
+            W_B_pt = ts.plain_tensor(W_B.T.tolist())
+            layer_tensors[layer_idx] = (W_A_pt, W_B_pt)
+
+        return layer_tensors

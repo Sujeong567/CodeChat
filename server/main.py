@@ -20,8 +20,8 @@ from common.protocol import (
     encode_bytes_to_base64,
     decode_base64_to_bytes,
 )
-from server.lora.adapter import get_fhe_lora_tensors
-from server.lora.inference import he_lora_inference
+from server.lora.adapter import get_multi_layer_qproj_tensors
+from server.lora.inference import he_lora_inference, he_lora_inference_multi_qproj
 
 PYDANTIC_V2 = pydantic_version.startswith("2.")
 def model_validate(model_cls, data):
@@ -40,10 +40,8 @@ async def lifespan(app: FastAPI):
     if HIDDEN_SIZE > max_slots:
         print(f"[Server] 경고: HiddenSize={HIDDEN_SIZE}, HE 슬롯={max_slots}")
 
-    # ✅ q_proj 하나에 대한 LoRA W_A, W_B만 준비
-    W_A_pt, W_B_pt = get_fhe_lora_tensors()
-    app_state["W_A_pt"] = W_A_pt
-    app_state["W_B_pt"] = W_B_pt
+    layer_tensors = get_multi_layer_qproj_tensors()
+    app_state["layer_qproj_tensors"] = layer_tensors
 
     print("[Server] 준비 완료")
     yield
@@ -51,18 +49,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
 @app.post("/compute_lora", response_model=EncryptedInferenceResponse)
 async def compute_lora(request: EncryptedInferenceRequest):
     try:
         ctx: ts.Context = app_state["he_context"]
-        W_A_pt = app_state["W_A_pt"]
-        W_B_pt = app_state["W_B_pt"]
+        layer_tensors = app_state["layer_qproj_tensors"]
 
         enc_bytes = decode_base64_to_bytes(request.enc_hidden_state_bytes)
         enc_vec = ts.ckks_vector_from(ctx, enc_bytes)
 
-        # ✅ 단일 q_proj LoRA delta만 계산
-        result_bytes = he_lora_inference(enc_vec, W_A_pt, W_B_pt, ctx)
+        # 🔥 32개 layer q_proj LoRA 모두 사용해서 단일 delta 계산
+        result_bytes = he_lora_inference_multi_qproj(enc_vec, layer_tensors, ctx)
         resp_b64 = encode_bytes_to_base64(result_bytes)
 
         return EncryptedInferenceResponse(enc_lora_delta_bytes=resp_b64)
