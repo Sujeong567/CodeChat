@@ -21,7 +21,7 @@ from common.protocol import (
     decode_base64_to_bytes,
 )
 from server.lora.adapter import get_multi_layer_qproj_tensors
-from server.lora.inference import he_lora_inference, he_lora_inference_multi_qproj
+from server.lora.inference import he_lora_inference_multi_qproj
 
 PYDANTIC_V2 = pydantic_version.startswith("2.")
 def model_validate(model_cls, data):
@@ -59,7 +59,7 @@ async def compute_lora(request: EncryptedInferenceRequest):
         enc_bytes = decode_base64_to_bytes(request.enc_hidden_state_bytes)
         enc_vec = ts.ckks_vector_from(ctx, enc_bytes)
 
-        # 🔥 32개 layer q_proj LoRA 모두 사용해서 단일 delta 계산
+        # 32개 layer q_proj LoRA 모두 사용해서 단일 delta 계산
         result_bytes = he_lora_inference_multi_qproj(enc_vec, layer_tensors, ctx)
         resp_b64 = encode_bytes_to_base64(result_bytes)
 

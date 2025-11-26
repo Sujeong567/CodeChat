@@ -55,7 +55,7 @@ def extract_lora_matrices(weights: dict, layer_name: str):
 
     return W_A, W_B
 
-N_LAYERS = 32  # 필요하면 config 에 넣어도 됨
+N_LAYERS = 32
 
 def get_multi_layer_qproj_tensors(lora_path: str = None):
     """
