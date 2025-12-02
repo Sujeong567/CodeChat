@@ -7,7 +7,7 @@ import tenseal as ts
 
 from common.config import (
     LORA_WEIGHTS_DIR, R_RANK, HIDDEN_SIZE,
-    TARGET_LAYER_INDEX, REPRESENTATIVE_LORA_TARGET_MODULE,
+    TARGET_LAYER_INDEX,
 )
 
 def load_lora_adapter(lora_path: str = None):
@@ -57,14 +57,14 @@ def extract_lora_matrices(weights: dict, layer_name: str):
 
 def get_fhe_lora_tensors(lora_path: str = None):
     """
-    q_proj 하나에 대해서만 (hidden, r), (r, hidden)을 plain_tensor로 반환
+    TARGET_LAYER_INDEX 의 self_attn.q_proj 에 대해서만
+    (hidden, r), (r, hidden)을 plain_tensor로 반환
     """
     try:
         lora_data = load_lora_adapter(lora_path)
         weights = lora_data["weights"]
 
-        # ex) model.layers.0.self_attn.q_proj
-        layer_name = f"base_model.model.model.layers.{TARGET_LAYER_INDEX}.self_attn.{REPRESENTATIVE_LORA_TARGET_MODULE}"
+        layer_name = f"base_model.model.model.layers.{TARGET_LAYER_INDEX}.self_attn.q_proj"
         W_A, W_B = extract_lora_matrices(weights, layer_name)
 
         # (r, hidden) -> (hidden, r)

@@ -50,14 +50,12 @@ class LLMPreProcessor:
                 use_cache=True,
             )
 
-        lora_xL_input = self.llm_loader.get_lora_xL_input()  # (1, hidden)
         current_llm_hidden_state = outputs.hidden_states[-1][0, -1, :].to(torch.bfloat16)
 
         return {
             "attention_mask": attention_mask,
             "past_key_values": outputs.past_key_values,
             "current_llm_hidden_state": current_llm_hidden_state,
-            "lora_xL_input": lora_xL_input,
             "generated_ids": input_ids.tolist()[0],
         }
 
@@ -79,7 +77,6 @@ class LLMPreProcessor:
                 use_cache=True,
             )
 
-        lora_xL_input = self.llm_loader.get_lora_xL_input()
         current_llm_hidden_state = outputs.hidden_states[-1][0, -1, :].to(torch.bfloat16)
 
         prev_state.update(
@@ -87,7 +84,6 @@ class LLMPreProcessor:
                 "attention_mask": new_mask,
                 "past_key_values": outputs.past_key_values,
                 "current_llm_hidden_state": current_llm_hidden_state,
-                "lora_xL_input": lora_xL_input,
             }
         )
         return prev_state

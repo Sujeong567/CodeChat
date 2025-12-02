@@ -37,5 +37,4 @@ class LLMPostProcessor:
 
     def decode_final_output(self, generated_ids: list) -> str:
         text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        # 실험 중이면 그냥 전체를 반환
         return text

@@ -15,7 +15,6 @@ class CKKSClientManager:
         tensor: torch.Tensor 또는 numpy.ndarray 둘 다 지원
         return: serialized bytes
         """
-        # --- numpy 혹은 torch 모두 지원하도록 개선 ---
         if isinstance(tensor, torch.Tensor):
             arr = tensor.detach().cpu().numpy().astype(np.float64)
         elif isinstance(tensor, np.ndarray):

@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
     if HIDDEN_SIZE > max_slots:
         print(f"[Server] 경고: HiddenSize={HIDDEN_SIZE}, HE 슬롯={max_slots}")
 
-    # ✅ q_proj 하나에 대한 LoRA W_A, W_B만 준비
+    # q_proj 하나에 대한 LoRA W_A, W_B만 준비
     W_A_pt, W_B_pt = get_fhe_lora_tensors()
     app_state["W_A_pt"] = W_A_pt
     app_state["W_B_pt"] = W_B_pt
@@ -61,7 +61,7 @@ async def compute_lora(request: EncryptedInferenceRequest):
         enc_bytes = decode_base64_to_bytes(request.enc_hidden_state_bytes)
         enc_vec = ts.ckks_vector_from(ctx, enc_bytes)
 
-        # ✅ 단일 q_proj LoRA delta만 계산
+        # 단일 q_proj LoRA delta만 계산
         result_bytes = he_lora_inference(enc_vec, W_A_pt, W_B_pt, ctx)
         resp_b64 = encode_bytes_to_base64(result_bytes)
 

@@ -1,7 +1,8 @@
 # client_backend/model/base_llm.py
 
-import collections
+import collections  # (지금은 크게 안 쓰지만 남겨둬도 무방)
 import torch
+import requests
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import get_peft_model
 from peft.tuners.lora import LoraLayer
@@ -11,19 +12,21 @@ from common.config import (
     HF_CACHE_DIR,
     BNB_COMPUTE_DTYPE,
     DEVICE,
-    TARGET_LAYER_INDEX,
-    REPRESENTATIVE_LORA_TARGET_MODULE,
+    TARGET_LAYER_INDEX,  # 15
 )
 from common.model_utils import get_bnb_config, get_lora_config
-
-GLOBAL_INJECTED_LORA_OUTPUT_DELTA = None
+from common.protocol import (
+    EncryptedInferenceRequest,
+    encode_bytes_to_base64,
+    decode_base64_to_bytes,
+)
 
 
 class BaseLLMLoader:
     """
     - 토크나이저 / Base LLM 로딩
     - QLoRA 래핑
-    - xL 캡처 / 델타 주입용 Hook 등록
+    - q_proj same-token FHE-LoRA hook 등록
     """
 
     def __init__(self):
@@ -33,12 +36,14 @@ class BaseLLMLoader:
         self._hidden_size = None
         self._eos_token_id = None
 
-        # 마지막 토큰의 xL 입력들을 순서대로 쌓아두는 큐
-        self._lora_xL_inputs_queue = collections.deque()
-
         # 등록된 hook 핸들 보관
         self._xL_pre_hooks = []
         self._output_post_hooks = []
+
+        # FHE 클라이언트 (나중에 attach_fhe_client 에서 주입)
+        self._ckks_manager = None
+        self._http_session = None
+        self._server_url = None
 
     # ------------------------------------------------------------------
     #  LayerNorm / final_ln 찾기 (PostProcessor에서 사용)
@@ -112,12 +117,29 @@ class BaseLLMLoader:
         self.reset_lora_weights()
         print("[BaseLLM] LoRA 래핑 완료 및 가중치 0 초기화.")
 
-        # xL 캡처 / 델타 주입용 Hook 등록
+        # 여기서는 아직 FHE 클라이언트 정보가 없을 수 있음
+        # attach_fhe_client 호출 이후 다시 _register_lora_hooks()를 부를 것
         self._register_lora_hooks()
 
         self._hidden_size = self._peft_model.config.hidden_size
         self._eos_token_id = self._tokenizer.eos_token_id
         print(f"[BaseLLM] Hidden Size = {self._hidden_size}, EOS ID = {self._eos_token_id}")
+
+    # ------------------------------------------------------------------
+    #  FHE 클라이언트 주입
+    # ------------------------------------------------------------------
+    def attach_fhe_client(self, ckks_manager, http_session: requests.Session, server_url: str):
+        """
+        ckks_manager: CKKSClientManager 인스턴스
+        http_session: requests.Session
+        server_url: FHE-LoRA 서버의 /compute_lora URL
+        """
+        self._ckks_manager = ckks_manager
+        self._http_session = http_session
+        self._server_url = server_url
+
+        # FHE 클라이언트 정보가 준비된 상태에서 hook 다시 등록
+        self._register_lora_hooks()
 
     # ------------------------------------------------------------------
     #  LoRA 관련 유틸
@@ -133,79 +155,95 @@ class BaseLLMLoader:
 
     def _register_lora_hooks(self):
         """
-        단일 representative LoRA 모듈 (예: model.layers.0.self_attn.q_proj)에만 hook 등록
+        레이어 TARGET_LAYER_INDEX 의 self_attn.q_proj에만
+        same-token FHE-LoRA hook 등록
         """
+        # 기존 hook 제거
         self.clear_lora_hooks()
 
+        # FHE 클라이언트가 아직 attach 안 됐다면 hook을 붙이지 않음
+        if self._ckks_manager is None or self._http_session is None or self._server_url is None:
+            print("[BaseLLM] FHE client not attached yet, skip LoRA hooks for now.")
+            return
+
         target_layer = TARGET_LAYER_INDEX
-        target_module = REPRESENTATIVE_LORA_TARGET_MODULE  # "q_proj"
-        target_signature = f"base_model.model.model.layers.{target_layer}.self_attn.{target_module}"
+        sig_q = f"base_model.model.model.layers.{target_layer}.self_attn.q_proj"
 
-        def save_xL_input_hook(module, args):
-            # args[0]: 입력 hidden state (B, T, H) 또는 (B, H)
-            x = args[0]
-            if x.dim() == 3:
-                last_token_input = x[:, -1, :].detach().clone()
-            else:
-                last_token_input = x.detach().clone()
-            self._lora_xL_inputs_queue.append(last_token_input)
-            print(f"[HOOK] xL captured: {last_token_input.shape}")
+        ckks = self._ckks_manager
+        session = self._http_session
+        server_url = self._server_url
 
-        def inject_delta_output_hook(module, input, output):
-            global GLOBAL_INJECTED_LORA_OUTPUT_DELTA
-            if GLOBAL_INJECTED_LORA_OUTPUT_DELTA is None:
+        def q_post_hook(module, inputs, output):
+            """
+            same-token q_proj hook:
+            1) 입력 x_L를 가져와서
+            2) CKKS 암호화 → 서버 /compute_lora → delta 복호화
+            3) 현재 q_proj output에 delta를 더한 뒤 반환
+            """
+            try:
+                x = inputs[0]  # (B,T,H) 또는 (B,H)
+                if x.dim() == 3:
+                    xL = x[:, -1, :].detach().clone()
+                else:
+                    xL = x.detach().clone()
+
+                # (1,H) → (H,)
+                xL_vec = xL.squeeze(0)
+
+                # 1) 암호화
+                enc_bytes = ckks.encrypt_tensor(xL_vec)
+                payload = {
+                    "enc_hidden_state_bytes": encode_bytes_to_base64(enc_bytes)
+                }
+
+                # 2) 서버 호출
+                res = session.post(server_url, json=payload)
+                res.raise_for_status()
+                resp_json = res.json()
+                enc_delta_b64 = resp_json["enc_lora_delta_bytes"]
+
+                # 3) delta 복호화
+                delta_bytes = decode_base64_to_bytes(enc_delta_b64)
+                delta_vec = ckks.decrypt_tensor(delta_bytes)  # (H,)
+                delta = delta_vec.unsqueeze(0).to(output.device)  # (1,H)
+
+                # 4) 현재 토큰의 q_proj output에 delta 주입
+                if output.dim() == 3:
+                    if delta.shape[-1] != output.shape[-1]:
+                        print(
+                            f"[WARN] q_proj delta mismatch: delta={delta.shape}, output={output.shape}"
+                        )
+                        return output
+                    output[:, -1, :] = output[:, -1, :] + delta.to(output.dtype)
+                elif output.dim() == 2:
+                    if delta.shape[-1] != output.shape[-1]:
+                        print(
+                            f"[WARN] q_proj delta mismatch: delta={delta.shape}, output={output.shape}"
+                        )
+                        return output
+                    output[:, :] = output[:, :] + delta.to(output.dtype)
+                else:
+                    print(f"[WARN] Unexpected q_proj output dim: {output.shape}")
+
                 return output
 
-            name = module.__class__.__qualname__
-            full_name = module.__dict__.get('_forward_module', None)
-
-            module_path = ""
-            for n, m in self._peft_model.named_modules():
-                if m is module:
-                    module_path = n
-                    break
-
-            if "q_proj" not in module_path:
-                # q_proj가 아닌 경우는 delta injection 하지 않음
+            except Exception as e:
+                import traceback
+                print("[HOOK] q_proj FHE-LoRA hook error:", e)
+                traceback.print_exc()
+                # 실패해도 모델이 죽지 않도록, 원본 output 그대로 반환
                 return output
 
-            delta = GLOBAL_INJECTED_LORA_OUTPUT_DELTA  # (1, H) 기대
-
-            # output: (B, T, H) 또는 (B, H)
-            if output.dim() == 3:
-                if delta.shape[-1] != output.shape[-1]:
-                    print(
-                        f"[WARN] Skip delta injection: delta={delta.shape}, output={output.shape}"
-                    )
-                    return output
-                output[:, -1, :] = output[:, -1, :] + delta.to(output.dtype)
-                print(f"[DELTA] Injected delta for q_proj at module={module_path}")
-
-            elif output.dim() == 2:
-                if delta.shape[-1] != output.shape[-1]:
-                    print(
-                        f"[WARN] Skip delta injection: delta={delta.shape}, output={output.shape}"
-                    )
-                    return output
-                output[:, :] = output[:, :] + delta.to(output.dtype)
-                print(f"[DELTA] Injected delta for q_proj at module={module_path}")
-                
-            else:
-                print(f"[WARN] Unexpected output dim: {output.shape}")
-            return output
-
+        # 실제 hook 등록
         for name, module in self._peft_model.named_modules():
-            if isinstance(module, LoraLayer) and target_signature in name:
-                pre_hook = module.register_forward_pre_hook(save_xL_input_hook)
-                post_hook = module.register_forward_hook(inject_delta_output_hook)
-                self._xL_pre_hooks.append(pre_hook)
+            if isinstance(module, LoraLayer) and sig_q in name:
+                post_hook = module.register_forward_hook(q_post_hook)
                 self._output_post_hooks.append(post_hook)
-                print(f"[HOOK] Registered hooks at: {name}")
+                print(f"[HOOK] Registered same-token q_proj hook at: {name}")
                 break
 
-
     def clear_lora_hooks(self):
-        """등록된 hook 제거 및 큐 초기화"""
+        """등록된 hook 제거"""
         for h in self._xL_pre_hooks + self._output_post_hooks:
             try:
                 h.remove()
@@ -213,31 +251,6 @@ class BaseLLMLoader:
                 pass
         self._xL_pre_hooks.clear()
         self._output_post_hooks.clear()
-        self._lora_xL_inputs_queue.clear()
-
-    def get_lora_xL_input(self) -> torch.Tensor:
-        """
-        PreProcessor에서 xL을 꺼갈 때 사용.
-        - 반환 shape: (batch, hidden)
-        """
-        if not self._lora_xL_inputs_queue:
-            raise RuntimeError("캡처된 xL 입력이 없습니다.")
-        return self._lora_xL_inputs_queue.popleft()
-
-    def set_global_lora_output_delta(self, delta: torch.Tensor):
-        """
-        delta: (1, H) 형태 텐서
-        """
-        global GLOBAL_INJECTED_LORA_OUTPUT_DELTA
-        GLOBAL_INJECTED_LORA_OUTPUT_DELTA = delta
-        print(f"[BaseLLM] Global LoRA delta set: {tuple(delta.shape)}")
-
-
-    def clear_global_lora_output_delta(self):
-        global GLOBAL_INJECTED_LORA_OUTPUT_DELTA
-        GLOBAL_INJECTED_LORA_OUTPUT_DELTA = None
-        print("[BaseLLM] Cleared global LoRA delta")
-
 
     # ------------------------------------------------------------------
     #  프로퍼티 / LM Head 가중치

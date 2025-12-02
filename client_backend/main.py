@@ -20,15 +20,10 @@ from common.config import (
     CLIENT_BACKEND_PORT,
     SERVER_HOST,
     SERVER_PORT,
-    DEVICE,
 )
 from common.protocol import (
     ClientBackendRequest,
     ClientBackendResponse,
-    EncryptedInferenceRequest,
-    EncryptedInferenceResponse,
-    encode_bytes_to_base64,
-    decode_base64_to_bytes,
 )
 from client_backend.crypto.ckks_client import CKKSClientManager
 from client_backend.model.base_llm import BaseLLMLoader
@@ -36,10 +31,7 @@ from client_backend.model.preprocessing import LLMPreProcessor
 from client_backend.model.postprocessing import LLMPostProcessor
 
 PYDANTIC_V2 = pydantic_version.startswith("2.")
-def model_dump(model):
-    return model.model_dump() if PYDANTIC_V2 else model.dict()
-def model_validate(model_cls, data):
-    return model_cls.model_validate(data) if PYDANTIC_V2 else model_cls.parse_obj(data)
+
 
 app_state = {}
 
@@ -53,18 +45,24 @@ async def lifespan(app: FastAPI):
     loader = BaseLLMLoader()
     loader.load_model()
 
+    ckks_manager = CKKSClientManager()
+    http_session = requests.Session()
+    server_url = f"http://{SERVER_HOST}:{SERVER_PORT}/compute_lora"
+
+    # q_proj same-token FHE-LoRA를 위해 loader에 FHE 클라이언트 주입
+    loader.attach_fhe_client(ckks_manager, http_session, server_url)
+
     app_state["llm_loader"] = loader
     app_state["preprocessor"] = LLMPreProcessor(loader)
     app_state["postprocessor"] = LLMPostProcessor(loader)
-    app_state["ckks_manager"] = CKKSClientManager()
-
-    app_state["http_session"] = requests.Session()
-    app_state["server_url"] = f"http://{SERVER_HOST}:{SERVER_PORT}/compute_lora"
+    app_state["ckks_manager"] = ckks_manager
+    app_state["http_session"] = http_session
+    app_state["server_url"] = server_url
 
     print("[ClientBackend] 초기화 완료")
     yield
 
-    app_state["http_session"].close()
+    http_session.close()
     loader.clear_lora_hooks()
     print("[ClientBackend] 서버 종료")
 
@@ -79,11 +77,8 @@ async def generate(request: ClientBackendRequest):
         loader: BaseLLMLoader = app_state["llm_loader"]
         preproc: LLMPreProcessor = app_state["preprocessor"]
         postproc: LLMPostProcessor = app_state["postprocessor"]
-        ckks: CKKSClientManager = app_state["ckks_manager"]
-        session: requests.Session = app_state["http_session"]
-        server_url: str = app_state["server_url"]
 
-        # 매 요청마다 LoRA 가중치 0으로 초기화
+        # 매 요청마다 LoRA 가중치 0으로 초기화 (FHE-LoRA만 쓰기 위해)
         loader.reset_lora_weights()
 
         # 1) 초기 상태
@@ -95,29 +90,7 @@ async def generate(request: ClientBackendRequest):
         for step in range(max_steps):
             print(f"[ClientBackend] Token step {step + 1}/{max_steps}")
 
-            # 2) 현재 xL (1, hidden) -> (hidden,) -> 암호화
-            xL = states["lora_xL_input"]  # (1, H)
-            xL_vec = xL.squeeze(0)        # (H,)
-            enc_bytes = ckks.encrypt_tensor(xL_vec)
-
-            # 3) 서버로 전송
-            req_obj = EncryptedInferenceRequest(
-                enc_hidden_state_bytes=encode_bytes_to_base64(enc_bytes)
-            )
-            res = session.post(server_url, json=model_dump(req_obj))
-            res.raise_for_status()
-            resp_obj = model_validate(EncryptedInferenceResponse, res.json())
-
-            # 4) 서버에서 계산한 LoRA delta 복호화
-            delta_bytes = decode_base64_to_bytes(resp_obj.enc_lora_delta_bytes)
-            delta_vec = ckks.decrypt_tensor(delta_bytes)  # (H,)
-            delta_tensor = delta_vec.unsqueeze(0).to(DEVICE)  # (1, H)
-
-            # 5) 델타를 전역에 설정 (hook이 사용)
-            loader.set_global_lora_output_delta(delta_tensor)
-
-
-            # 6) 현재 hidden state 기반으로 다음 토큰 argmax
+            # 2) 현재 hidden state 기반으로 다음 토큰 argmax
             next_token_id, next_token_char = postproc.integrate_lora_delta_and_predict_token(
                 states["current_llm_hidden_state"]
             )
@@ -129,11 +102,9 @@ async def generate(request: ClientBackendRequest):
                 print("  EOS 토큰 감지, 종료.")
                 break
 
-            # 7) LLM 상태 업데이트 (이때 hook이 delta 주입하고 새 xL 캡처)
+            # 3) LLM 상태 업데이트
+            #    (이 forward 과정에서 q_proj same-token hook이 FHE-LoRA를 수행함)
             states = preproc.get_next_token_states(next_token_id, states)
-
-            # 8) 델타 주입 완료 후 전역 delta 초기화
-            loader.clear_global_lora_output_delta()
 
         final_text = postproc.decode_final_output(generated_ids)
         elapsed = time.time() - start_time
