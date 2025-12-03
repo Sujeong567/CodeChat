@@ -3,25 +3,13 @@ from pydantic import BaseModel
 import base64
 
 class EncryptedInferenceRequest(BaseModel):
-    """
-    enc_dict:
-        {
-            "(15,'q_proj')" : "<base64 bytes>",
-            "(15,'v_proj')" : "<base64 bytes>"
-        }
-    """
-    enc_dict: dict[str, str]
+    layer_idx: int
+    module_name: str      # "q_proj", "k_proj", "v_proj", "o_proj"
+    enc_hidden_state_bytes: str  # Base64 인코딩 bytes
 
 
 class EncryptedInferenceResponse(BaseModel):
-    """
-    enc_delta_dict:
-        {
-            "(15,'q_proj')" : "<base64 bytes>",
-            "(15,'v_proj')" : "<base64 bytes>"
-        }
-    """
-    enc_delta_dict: dict[str, str]
+    enc_lora_delta_bytes: str    # Base64 인코딩 bytes
 
 
 class ClientBackendRequest(BaseModel):

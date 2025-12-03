@@ -2,10 +2,12 @@ import os
 import sys
 import time
 import gc
-import torch
 import requests
+
+import torch
 from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
+from pydantic import __version__ as pydantic_version
 import uvicorn
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,29 +19,24 @@ from common.config import (
     CLIENT_BACKEND_PORT,
     SERVER_HOST,
     SERVER_PORT,
-    DEVICE,
 )
 from common.protocol import (
     ClientBackendRequest,
     ClientBackendResponse,
-    EncryptedInferenceRequest,
-    EncryptedInferenceResponse,
-    encode_bytes_to_base64,
-    decode_base64_to_bytes,
 )
-
 from client_backend.crypto.ckks_client import CKKSClientManager
 from client_backend.model.base_llm import BaseLLMLoader
 from client_backend.model.preprocessing import LLMPreProcessor
 from client_backend.model.postprocessing import LLMPostProcessor
 
+PYDANTIC_V2 = pydantic_version.startswith("2.")
 
 app_state = {}
 
 
 @asynccontextmanager
-async def lifespan(app):
-    print("[ClientBackend] Starting — loading model and keys")
+async def lifespan(app: FastAPI):
+    print("[ClientBackend] 서버 시작 - 모델/키 로드")
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -47,99 +44,79 @@ async def lifespan(app):
     loader = BaseLLMLoader()
     loader.load_model()
 
-    ckks = CKKSClientManager()
-    session = requests.Session()
+    ckks_manager = CKKSClientManager()
+    http_session = requests.Session()
     server_url = f"http://{SERVER_HOST}:{SERVER_PORT}/compute_lora"
 
-    loader.attach_fhe_client(ckks, session, server_url)
+    # same-token FHE-LoRA를 위해 FHE 클라이언트 주입
+    loader.attach_fhe_client(ckks_manager, http_session, server_url)
 
-    app_state["loader"] = loader
-    app_state["pre"] = LLMPreProcessor(loader)
-    app_state["post"] = LLMPostProcessor(loader)
-    app_state["ckks"] = ckks
-    app_state["session"] = session
+    app_state["llm_loader"] = loader
+    app_state["preprocessor"] = LLMPreProcessor(loader)
+    app_state["postprocessor"] = LLMPostProcessor(loader)
+    app_state["ckks_manager"] = ckks_manager
+    app_state["http_session"] = http_session
     app_state["server_url"] = server_url
 
-    print("[ClientBackend] Ready.")
+    print("[ClientBackend] 초기화 완료")
     yield
 
-    session.close()
-    loader.clear_hooks()
-    print("[ClientBackend] Shutdown complete.")
+    http_session.close()
+    loader.clear_fhe_hooks()
+    print("[ClientBackend] 서버 종료")
 
 
 app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/generate", response_model=ClientBackendResponse)
-async def generate(req: ClientBackendRequest):
-    t0 = time.time()
-
+async def generate(request: ClientBackendRequest):
+    start_time = time.time()
     try:
-        loader = app_state["loader"]
-        pre = app_state["pre"]
-        post = app_state["post"]
-        ckks = app_state["ckks"]
-        session = app_state["session"]
-        server_url = app_state["server_url"]
+        print(f"[ClientBackend] 추론 요청: '{request.prompt[:80]}' ...")
 
+        loader: BaseLLMLoader = app_state["llm_loader"]
+        preproc: LLMPreProcessor = app_state["preprocessor"]
+        postproc: LLMPostProcessor = app_state["postprocessor"]
+
+        # 매 요청마다 LoRA 가중치 0 초기화 (FHE-LoRA만 사용)
         loader.reset_lora_weights()
 
-        states = pre.get_initial_states(req.prompt)
-        gen_ids = states["generated_ids"][:]
+        # 1) 초기 상태
+        states = preproc.get_initial_states(request.prompt)
+        generated_ids = states["generated_ids"][:]
 
-        for step in range(req.max_new_tokens):
-            print(f"[ClientBackend] Step {step+1}/{req.max_new_tokens}")
+        max_steps = request.max_new_tokens
 
-            xl_dict = states["xl_dict"]
+        for step in range(max_steps):
+            print(f"[ClientBackend] Step {step + 1}/{max_steps}")
 
-            # 1) x_L 암호화
-            enc_dict = {}
-            for key, xl in xl_dict.items():
-                vec = xl.squeeze(0).cpu().numpy()
-                enc_bytes = ckks.encrypt_tensor(vec)
-                enc_dict[key] = encode_bytes_to_base64(enc_bytes)
-
-            # 2) 서버 요청
-            enc_req = EncryptedInferenceRequest(enc_dict=enc_dict)
-            http_res = session.post(server_url, json=enc_req.model_dump())
-            http_res.raise_for_status()
-            fhe_res = EncryptedInferenceResponse.model_validate(http_res.json())
-
-            # 3) delta 복호화
-            delta_dict = {}
-            for key, enc_b64 in fhe_res.enc_delta_dict.items():
-                b = decode_base64_to_bytes(enc_b64)
-                v = ckks.decrypt_tensor(b)
-                delta_dict[key] = v.unsqueeze(0).to(DEVICE)
-
-            # 4) delta 주입 설정
-            loader.set_delta(delta_dict)
-
-            # 5) 다음 토큰 생성
-            next_id, next_char = post.integrate_lora_delta_and_predict_token(
-                states["current_hidden"]
+            # 2) 현재 hidden 기반으로 next token 예측
+            next_token_id, next_token_char = postproc.integrate_lora_delta_and_predict_token(
+                states["current_llm_hidden_state"]
             )
-            print(f"  → token: {repr(next_char)}")
-            gen_ids.append(next_id)
+            generated_ids.append(next_token_id)
+            print(f"  -> 생성 토큰: {repr(next_token_char)}")
 
-            if next_id == loader.eos_token_id:
-                print("  EOS detected.")
+            if next_token_id == loader.eos_token_id:
+                print("  EOS 토큰 감지, 종료.")
                 break
 
-            # 6) forward → same-token hook → next x_L 얻기
-            states = pre.get_next_token_states(next_id, states)
+            # 3) next_token을 넣어 한 step forward
+            #    이 forward 과정에서 각 레이어/모듈의 same-token FHE-LoRA hook이 실행됨
+            states = preproc.get_next_token_states(next_token_id, states)
 
-            # delta 초기화
-            loader.reset_delta()
+        final_text = postproc.decode_final_output(generated_ids)
+        elapsed = time.time() - start_time
 
-        txt = post.decode_final_output(gen_ids)
-        elapsed = time.time() - t0
-        print(f"[ClientBackend] DONE ({elapsed:.2f}s)")
-        print(txt[:500])
+        print("[ClientBackend] 최종 결과:")
+        print(final_text[:500])
+        print(f"[ClientBackend] 소요 시간: {elapsed:.2f}초")
 
         return ClientBackendResponse(
-            generated_text=txt, status="success", message=f"OK ({elapsed:.2f}s)"
+            generated_text=final_text,
+            status="success",
+            message=f"LLM 추론 완료 ({elapsed:.2f}초)",
         )
 
     except Exception as e:

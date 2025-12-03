@@ -1,4 +1,3 @@
-# common/config.py
 import os
 import torch
 
@@ -38,16 +37,12 @@ LORA_WEIGHTS_DIR = os.path.join(
 )
 
 # --- FHE 실험용 설정 ---
-# 어떤 레이어들을 FHE-LoRA로 사용할지
-FHE_LAYERS = [15]   # 예: [4, 10, 20, 30]
+# same-token FHE-LoRA를 적용할 레이어들
+FHE_LAYERS = [15]    # 예: [4, 10, 15, 20]
 
-# 어떤 모듈들을 FHE-LoRA로 사용할지 (q_proj 고정 + 1)
-FHE_MODULES = ["q_proj", "o_proj"]    # 또는 ["q_proj", "v_proj"], ["q_proj", "o_proj"]
-
-# 어떤 레이어의 q_proj 입력을 캡처할지
-TARGET_LAYER_INDEX = 15
-REPRESENTATIVE_LORA_TARGET_MODULE = "q_proj"
-LORA_INJECTION_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
+# same-token FHE-LoRA를 적용할 모듈들
+# 항상 "q_proj"는 포함시키고, 원하는 모듈을 추가로 켜서 실험 가능
+FHE_MODULES = ["q_proj"]  # 예: ["q_proj", "v_proj"], ["q_proj", "o_proj"]
 
 # --- Homomorphic Encryption (HE) 설정 ---
 HE_POLY_MODULUS_DEGREE = 16384
@@ -60,7 +55,7 @@ SERVER_PUBLIC_KEY_PATH = os.path.join(HE_KEY_DIR, "server_public.bin")
 
 # --- LLM 추론 설정 ---
 MAX_GEN_LENGTH = 300
-SCALE_INJECTION = LORA_ALPHA / R_RANK  # 논문 구조 맞추려면 여기 스케일 사용 가능
+SCALE_INJECTION = LORA_ALPHA / R_RANK
 
 # --- 디바이스 ---
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"

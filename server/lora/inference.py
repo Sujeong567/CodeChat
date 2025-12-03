@@ -3,17 +3,14 @@ import tenseal as ts
 
 def he_lora_inference(enc_input: ts.CKKSVector, W_A_pt, W_B_pt, ctx: ts.Context) -> bytes:
     """
-    enc_input: CKKSVector (길이 = HIDDEN_SIZE)
-    W_A_pt: plain_tensor (H, R)
-    W_B_pt: plain_tensor (R, H)
-
-    반환: enc_logits_lora.serialize()  (H,) CKKSVector를 serialize한 bytes
+    enc_input: CKKSVector (H,)
+    W_A_pt: plain_tensor (H, r)
+    W_B_pt: plain_tensor (r, H)
     """
     print("[Server] FHE LoRA 연산 시작")
 
-    # enc_input: (H,)
-    enc_intermediate = enc_input.matmul(W_A_pt)       # (R)
-    enc_logits_lora = enc_intermediate.matmul(W_B_pt) # (H)
+    enc_intermediate = enc_input.matmul(W_A_pt)       # (r,)
+    enc_logits_lora = enc_intermediate.matmul(W_B_pt) # (H,)
 
     try:
         enc_logits_lora.rescale_()

@@ -14,9 +14,9 @@ from common.config import (
 )
 
 
-def load_lora_adapter(lora_path: str = None):
+def load_lora_weights(lora_path: str = None):
     """
-    LoRA 어댑터 전체를 로드해서 (weights, config) 반환
+    adapter_config.json + adapter_model.safetensors 로드
     """
     if lora_path is None:
         lora_path = LORA_WEIGHTS_DIR
@@ -32,71 +32,65 @@ def load_lora_adapter(lora_path: str = None):
     return weights, config
 
 
-def extract_lora_matrices(weights: dict, layer_name: str):
+def extract_lora_matrices(weights: dict, key_prefix: str):
     """
-    특정 layer_name (예: "base_model.model.model.layers.15.self_attn.q_proj")에 대해
-    lora_A, lora_B 행렬을 추출하여 (W_A, W_B)로 반환
-
-    - W_A: (r, H)
-    - W_B: (H, r)
+    key_prefix:
+      "base_model.model.model.layers.15.self_attn.q_proj"
+    에 대해
+      "...lora_A.weight", "...lora_B.weight" 찾아서 반환
     """
-    lora_A_key = None
-    lora_B_key = None
+    A_key = None
+    B_key = None
 
-    for key in weights.keys():
-        if layer_name in key:
-            if "lora_A" in key:
-                lora_A_key = key
-            elif "lora_B" in key:
-                lora_B_key = key
+    for k in weights.keys():
+        if key_prefix in k:
+            if "lora_A" in k:
+                A_key = k
+            elif "lora_B" in k:
+                B_key = k
 
-    if lora_A_key is None or lora_B_key is None:
-        raise ValueError(f"[Adapter] LoRA 행렬 없음: {layer_name}")
+    if A_key is None or B_key is None:
+        raise ValueError(f"[Adapter] LoRA 행렬 없음: {key_prefix}")
 
-    W_A = weights[lora_A_key].float()
-    W_B = weights[lora_B_key].float()
-
-    print(f"[Adapter] Layer: {layer_name}")
-    print(f"          W_A: {tuple(W_A.shape)}, W_B: {tuple(W_B.shape)}")
-
+    W_A = weights[A_key].float()  # (r, hidden)
+    W_B = weights[B_key].float()  # (hidden, r)
+    print(f"[Adapter] {key_prefix}")
+    print(f"         W_A: {W_A.shape}, W_B: {W_B.shape}")
     return W_A, W_B
 
 
 def get_multi_fhe_lora_tensors():
     """
-    (layer, module) → (W_A_pt, W_B_pt)
-    형태의 dict를 반환
-
-    - FHE_LAYERS × FHE_MODULES 조합 전체에 대해
-      TenSEAL plain_tensor로 변환해서 미리 메모리에 올려둔다.
+    (layer_idx, module_name) → (W_A_pt, W_B_pt) 의 dict를 반환
+    - W_A_pt: (H, r)  plain_tensor
+    - W_B_pt: (r, H)  plain_tensor
     """
-    weights, _ = load_lora_adapter()
+    weights, _ = load_lora_weights()
     fhe_dict = {}
 
     for layer_idx in FHE_LAYERS:
         for mod in FHE_MODULES:
-            layer_name = f"base_model.model.model.layers.{layer_idx}.self_attn.{mod}"
-
+            prefix = f"base_model.model.model.layers.{layer_idx}.self_attn.{mod}"
             try:
-                W_A, W_B = extract_lora_matrices(weights, layer_name)
+                W_A, W_B = extract_lora_matrices(weights, prefix)
 
-                # (r, H) → (H, r)
+                # (r, H) -> (H, r), (H, r)^T -> (r, H)
                 W_A_pt = ts.plain_tensor(W_A.T.float().tolist())
                 W_B_pt = ts.plain_tensor(W_B.T.float().tolist())
 
                 fhe_dict[(layer_idx, mod)] = (W_A_pt, W_B_pt)
-                print(f"[Adapter] Loaded LoRA for ({layer_idx}, {mod})")
+                print(f"[Adapter] LoRA FHE tensor ready: (layer={layer_idx}, mod={mod})")
 
             except Exception as e:
-                print(f"[Adapter] FAILED loading {layer_name}: {e}")
-                print("[Adapter]  → ZERO tensor fallback 사용")
+                print(f"[Adapter] FAILED for {prefix}: {e}")
+                # zero fallback
+                W_Az = torch.zeros(R_RANK, HIDDEN_SIZE).float()
+                W_Bz = torch.zeros(HIDDEN_SIZE, R_RANK).float()
+                fhe_dict[(layer_idx, mod)] = (
+                    ts.plain_tensor(W_Az.T.tolist()),
+                    ts.plain_tensor(W_Bz.T.tolist()),
+                )
+                print(f"[Adapter] ZERO tensor inserted for (layer={layer_idx}, mod={mod})")
 
-                W_A_zero = torch.zeros(R_RANK, HIDDEN_SIZE).float()
-                W_B_zero = torch.zeros(HIDDEN_SIZE, R_RANK).float()
-
-                W_A_pt = ts.plain_tensor(W_A_zero.T.tolist())
-                W_B_pt = ts.plain_tensor(W_B_zero.T.tolist())
-                fhe_dict[(layer_idx, mod)] = (W_A_pt, W_B_pt)
-
-    print(f"[Adapter] 총 {len(fhe_dict)}개 (layer, module) LoRA 준비 완료")
+    print(f"[Adapter] 총 {len(fhe_dict)}개 (layer, module) LoRA 텐서 준비 완료")
     return fhe_dict
