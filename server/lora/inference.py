@@ -6,6 +6,8 @@ def he_lora_inference(enc_input: ts.CKKSVector, W_A_pt, W_B_pt, ctx: ts.Context)
     enc_input: CKKSVector (길이 = HIDDEN_SIZE)
     W_A_pt: plain_tensor (H, R)
     W_B_pt: plain_tensor (R, H)
+
+    반환: enc_logits_lora.serialize()  (H,) CKKSVector를 serialize한 bytes
     """
     print("[Server] FHE LoRA 연산 시작")
 

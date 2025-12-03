@@ -1,9 +1,6 @@
-# client_backend/model/base_llm.py
-
-import collections  # (지금은 크게 안 쓰지만 남겨둬도 무방)
+import collections
 import torch
-import requests
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import get_peft_model
 from peft.tuners.lora import LoraLayer
 
@@ -12,21 +9,19 @@ from common.config import (
     HF_CACHE_DIR,
     BNB_COMPUTE_DTYPE,
     DEVICE,
-    TARGET_LAYER_INDEX,  # 15
+    FHE_LAYERS,
+    FHE_MODULES,
 )
 from common.model_utils import get_bnb_config, get_lora_config
-from common.protocol import (
-    EncryptedInferenceRequest,
-    encode_bytes_to_base64,
-    decode_base64_to_bytes,
-)
+
+
+# (layer, module) → delta tensor
+GLOBAL_DELTA_DICT = {}
 
 
 class BaseLLMLoader:
     """
-    - 토크나이저 / Base LLM 로딩
-    - QLoRA 래핑
-    - q_proj same-token FHE-LoRA hook 등록
+    Multi-layer × Multi-module Same-token FHE-LoRA 지원 LLM Loader
     """
 
     def __init__(self):
@@ -36,11 +31,15 @@ class BaseLLMLoader:
         self._hidden_size = None
         self._eos_token_id = None
 
-        # 등록된 hook 핸들 보관
-        self._xL_pre_hooks = []
-        self._output_post_hooks = []
+        # (layer,module) → x_L queue
+        self._xl_queue = {
+            (l, m): collections.deque() for l in FHE_LAYERS for m in FHE_MODULES
+        }
 
-        # FHE 클라이언트 (나중에 attach_fhe_client 에서 주입)
+        self._pre_hooks = []
+        self._post_hooks = []
+
+        # FHE 클라이언트 관련
         self._ckks_manager = None
         self._http_session = None
         self._server_url = None
@@ -51,23 +50,27 @@ class BaseLLMLoader:
     @staticmethod
     def _find_final_layernorm(module: torch.nn.Module):
         """
-        lm_head 직전 최종 LayerNorm 추정해서 반환
+        LLM 구조에서 lm_head 직전에 있는 Final LayerNorm을 자동으로 탐색하여 반환
         (StarCoder2 기준으로 마지막 LayerNorm 후보들 중 마지막 것을 선택)
         """
         candidates = []
         for name, m in module.named_modules():
-            n_lower = name.lower()
-            if "ln_f" in n_lower or "layernorm" in n_lower or "norm" in n_lower:
+            lname = name.lower()
+            if "ln_f" in lname or "layernorm" in lname or "norm" in lname:
                 candidates.append((name, m))
+
         if candidates:
+            # 마지막 LayerNorm이 실제 final_ln일 확률이 높음
             return candidates[-1][1]
+
+        print("[WARN] Final LayerNorm을 찾지 못했습니다.")
         return None
 
     # ------------------------------------------------------------------
-    #  모델 로딩
+    # 모델 로딩
     # ------------------------------------------------------------------
     def load_model(self):
-        print(f"[BaseLLM] 토크나이저 로딩 중: {LLM_NAME}")
+        print(f"[BaseLLM] Loading tokenizer: {LLM_NAME}")
         self._tokenizer = AutoTokenizer.from_pretrained(
             LLM_NAME,
             cache_dir=HF_CACHE_DIR,
@@ -75,9 +78,9 @@ class BaseLLMLoader:
         )
         if self._tokenizer.pad_token is None:
             self._tokenizer.pad_token = self._tokenizer.eos_token
-        print("[BaseLLM] 토크나이저 로딩 완료.")
+        print("[BaseLLM] Tokenizer loaded.")
 
-        print("[BaseLLM] Base LLM 로딩 중 (4bit / bfloat16 compute)...")
+        print("[BaseLLM] Loading base model (4bit)...")
         bnb_config = get_bnb_config()
         base_model = AutoModelForCausalLM.from_pretrained(
             LLM_NAME,
@@ -88,172 +91,142 @@ class BaseLLMLoader:
             trust_remote_code=True,
         )
 
-        # vocab 크기 맞추기 (학습 시 special tokens 추가된 경우 대비)
+        # vocab resize 대응
         need_vocab = len(self._tokenizer)
         have_vocab = base_model.get_input_embeddings().weight.shape[0]
-        if have_vocab != need_vocab:
-            print(f"[BaseLLM] resize_token_embeddings: {have_vocab} -> {need_vocab}")
+        if need_vocab != have_vocab:
             base_model.resize_token_embeddings(need_vocab)
 
         base_model.eval()
-        print("[BaseLLM] Base LLM 로딩 완료.")
+        print("[BaseLLM] Base model loaded.")
 
-        # LayerNorm / Norm 계열은 float32로 캐스팅
-        for _name, module in base_model.named_modules():
+        # LayerNorm/Norm 계열 float32
+        for name, module in base_model.named_modules():
             if isinstance(module, torch.nn.LayerNorm) or "Norm" in module.__class__.__name__:
                 module.float()
 
-        # lm_head도 float32로
+        # lm_head float32
         if hasattr(base_model, "lm_head"):
             base_model.lm_head = base_model.lm_head.to(torch.float32)
 
         self._base_model = base_model
 
-        # QLoRA 슬롯 생성 (학습과 동일 target_modules)
+        # QLoRA 래핑
         lora_config = get_lora_config()
         self._peft_model = get_peft_model(self._base_model, lora_config)
-
-        # LoRA 가중치 0으로 초기화 (실제 효과는 FHE 델타로만 반영)
         self.reset_lora_weights()
-        print("[BaseLLM] LoRA 래핑 완료 및 가중치 0 초기화.")
+        print("[BaseLLM] LoRA wrapping done.")
 
-        # 여기서는 아직 FHE 클라이언트 정보가 없을 수 있음
-        # attach_fhe_client 호출 이후 다시 _register_lora_hooks()를 부를 것
-        self._register_lora_hooks()
+        # hook은 FHE 클라이언트 attach 후 다시 등록됨
+        self._register_hooks()
 
         self._hidden_size = self._peft_model.config.hidden_size
         self._eos_token_id = self._tokenizer.eos_token_id
-        print(f"[BaseLLM] Hidden Size = {self._hidden_size}, EOS ID = {self._eos_token_id}")
+        print(f"[BaseLLM] Hidden={self._hidden_size}, EOS={self._eos_token_id}")
 
     # ------------------------------------------------------------------
-    #  FHE 클라이언트 주입
+    # FHE 클라이언트 등록
     # ------------------------------------------------------------------
-    def attach_fhe_client(self, ckks_manager, http_session: requests.Session, server_url: str):
-        """
-        ckks_manager: CKKSClientManager 인스턴스
-        http_session: requests.Session
-        server_url: FHE-LoRA 서버의 /compute_lora URL
-        """
+    def attach_fhe_client(self, ckks_manager, http_session, server_url):
         self._ckks_manager = ckks_manager
         self._http_session = http_session
         self._server_url = server_url
 
-        # FHE 클라이언트 정보가 준비된 상태에서 hook 다시 등록
-        self._register_lora_hooks()
+        # hook 다시 등록
+        self._register_hooks()
 
     # ------------------------------------------------------------------
-    #  LoRA 관련 유틸
+    # LoRA 가중치 0으로 초기화
     # ------------------------------------------------------------------
     def reset_lora_weights(self):
-        """모든 LoRA 어댑터 가중치를 0으로 초기화"""
         if self._peft_model is None:
             return
         for name, param in self._peft_model.named_parameters():
             if "lora_" in name:
                 param.data.zero_()
-        print("[BaseLLM] 모든 LoRA 어댑터 가중치를 0으로 리셋했습니다.")
-
-    def _register_lora_hooks(self):
-        """
-        레이어 TARGET_LAYER_INDEX 의 self_attn.q_proj에만
-        same-token FHE-LoRA hook 등록
-        """
-        # 기존 hook 제거
-        self.clear_lora_hooks()
-
-        # FHE 클라이언트가 아직 attach 안 됐다면 hook을 붙이지 않음
-        if self._ckks_manager is None or self._http_session is None or self._server_url is None:
-            print("[BaseLLM] FHE client not attached yet, skip LoRA hooks for now.")
-            return
-
-        target_layer = TARGET_LAYER_INDEX
-        sig_q = f"base_model.model.model.layers.{target_layer}.self_attn.q_proj"
-
-        ckks = self._ckks_manager
-        session = self._http_session
-        server_url = self._server_url
-
-        def q_post_hook(module, inputs, output):
-            """
-            same-token q_proj hook:
-            1) 입력 x_L를 가져와서
-            2) CKKS 암호화 → 서버 /compute_lora → delta 복호화
-            3) 현재 q_proj output에 delta를 더한 뒤 반환
-            """
-            try:
-                x = inputs[0]  # (B,T,H) 또는 (B,H)
-                if x.dim() == 3:
-                    xL = x[:, -1, :].detach().clone()
-                else:
-                    xL = x.detach().clone()
-
-                # (1,H) → (H,)
-                xL_vec = xL.squeeze(0)
-
-                # 1) 암호화
-                enc_bytes = ckks.encrypt_tensor(xL_vec)
-                payload = {
-                    "enc_hidden_state_bytes": encode_bytes_to_base64(enc_bytes)
-                }
-
-                # 2) 서버 호출
-                res = session.post(server_url, json=payload)
-                res.raise_for_status()
-                resp_json = res.json()
-                enc_delta_b64 = resp_json["enc_lora_delta_bytes"]
-
-                # 3) delta 복호화
-                delta_bytes = decode_base64_to_bytes(enc_delta_b64)
-                delta_vec = ckks.decrypt_tensor(delta_bytes)  # (H,)
-                delta = delta_vec.unsqueeze(0).to(output.device)  # (1,H)
-
-                # 4) 현재 토큰의 q_proj output에 delta 주입
-                if output.dim() == 3:
-                    if delta.shape[-1] != output.shape[-1]:
-                        print(
-                            f"[WARN] q_proj delta mismatch: delta={delta.shape}, output={output.shape}"
-                        )
-                        return output
-                    output[:, -1, :] = output[:, -1, :] + delta.to(output.dtype)
-                elif output.dim() == 2:
-                    if delta.shape[-1] != output.shape[-1]:
-                        print(
-                            f"[WARN] q_proj delta mismatch: delta={delta.shape}, output={output.shape}"
-                        )
-                        return output
-                    output[:, :] = output[:, :] + delta.to(output.dtype)
-                else:
-                    print(f"[WARN] Unexpected q_proj output dim: {output.shape}")
-
-                return output
-
-            except Exception as e:
-                import traceback
-                print("[HOOK] q_proj FHE-LoRA hook error:", e)
-                traceback.print_exc()
-                # 실패해도 모델이 죽지 않도록, 원본 output 그대로 반환
-                return output
-
-        # 실제 hook 등록
-        for name, module in self._peft_model.named_modules():
-            if isinstance(module, LoraLayer) and sig_q in name:
-                post_hook = module.register_forward_hook(q_post_hook)
-                self._output_post_hooks.append(post_hook)
-                print(f"[HOOK] Registered same-token q_proj hook at: {name}")
-                break
-
-    def clear_lora_hooks(self):
-        """등록된 hook 제거"""
-        for h in self._xL_pre_hooks + self._output_post_hooks:
-            try:
-                h.remove()
-            except Exception:
-                pass
-        self._xL_pre_hooks.clear()
-        self._output_post_hooks.clear()
+        print("[BaseLLM] LoRA weights reset.")
 
     # ------------------------------------------------------------------
-    #  프로퍼티 / LM Head 가중치
+    # delta 관리
+    # ------------------------------------------------------------------
+    def reset_delta(self):
+        GLOBAL_DELTA_DICT.clear()
+
+    def set_delta(self, delta_dict):
+        """
+        delta_dict: key "(15,'q_proj')" → tensor
+        """
+        for key, val in delta_dict.items():
+            layer_idx, mod = eval(key)
+            GLOBAL_DELTA_DICT[(layer_idx, mod)] = val
+
+    # ------------------------------------------------------------------
+    # Hook 등록
+    # ------------------------------------------------------------------
+    def _register_hooks(self):
+        self.clear_hooks()
+
+        if self._ckks_manager is None:
+            print("[BaseLLM] FHE client not attached yet. skip hooks.")
+            return
+
+        def parse_layer(path):
+            # e.g. "base_model.model.model.layers.15.self_attn.q_proj"
+            parts = path.split(".")
+            return int(parts[4]), parts[-1]
+
+        def make_pre_hook(layer_idx, module_name):
+            def hook(module, args):
+                x = args[0]
+                last = x[:, -1, :] if x.dim() == 3 else x
+                self._xl_queue[(layer_idx, module_name)].append(last.detach().clone())
+            return hook
+
+        def make_post_hook(layer_idx, module_name):
+            def hook(module, inp, out):
+                delta = GLOBAL_DELTA_DICT.get((layer_idx, module_name), None)
+                if delta is None:
+                    return out
+                if out.dim() == 3:
+                    out[:, -1, :] += delta.to(out.dtype)
+                else:
+                    out += delta.to(out.dtype)
+                return out
+            return hook
+
+        for name, module in self._peft_model.named_modules():
+            if not isinstance(module, LoraLayer):
+                continue
+
+            layer_idx, mod = parse_layer(name)
+
+            if layer_idx in FHE_LAYERS and mod in FHE_MODULES:
+                pre = module.register_forward_pre_hook(make_pre_hook(layer_idx, mod))
+                post = module.register_forward_hook(make_post_hook(layer_idx, mod))
+                self._pre_hooks.append(pre)
+                self._post_hooks.append(post)
+                print(f"[HOOK] Registered ({layer_idx}, {mod})")
+
+    def clear_hooks(self):
+        for h in self._pre_hooks + self._post_hooks:
+            try:
+                h.remove()
+            except:
+                pass
+        self._pre_hooks.clear()
+        self._post_hooks.clear()
+
+    # ------------------------------------------------------------------
+    # x_L 배치 전달 (모든 layer,module)
+    # ------------------------------------------------------------------
+    def get_xl_batch(self):
+        batch = {}
+        for key, q in self._xl_queue.items():
+            if not q:
+                raise RuntimeError(f"x_L missing: {key}")
+            batch[str(key)] = q.popleft()
+        return batch
+
     # ------------------------------------------------------------------
     @property
     def tokenizer(self):
@@ -272,9 +245,6 @@ class BaseLLMLoader:
         return self._eos_token_id
 
     def get_lm_head_weights(self):
-        """
-        PostProcessor에서 사용할 LM Head 가중치 (float32) 반환
-        """
         lm_head = self._peft_model.base_model.lm_head
         w = lm_head.weight.data.to(torch.float32)
         b = getattr(lm_head, "bias", None)

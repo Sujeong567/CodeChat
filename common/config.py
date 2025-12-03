@@ -37,6 +37,13 @@ LORA_WEIGHTS_DIR = os.path.join(
     PROJECT_ROOT, "server", "lora", "lora_weights_checkpoints_final"
 )
 
+# --- FHE 실험용 설정 ---
+# 어떤 레이어들을 FHE-LoRA로 사용할지
+FHE_LAYERS = [15]   # 예: [4, 10, 20, 30]
+
+# 어떤 모듈들을 FHE-LoRA로 사용할지 (q_proj 고정 + 1)
+FHE_MODULES = ["q_proj", "o_proj"]    # 또는 ["q_proj", "v_proj"], ["q_proj", "o_proj"]
+
 # 어떤 레이어의 q_proj 입력을 캡처할지
 TARGET_LAYER_INDEX = 15
 REPRESENTATIVE_LORA_TARGET_MODULE = "q_proj"

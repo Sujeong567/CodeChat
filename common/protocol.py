@@ -3,13 +3,25 @@ from pydantic import BaseModel
 import base64
 
 class EncryptedInferenceRequest(BaseModel):
-    # q_proj x_L 하나만 보내는 구조
-    enc_hidden_state_bytes: str  # Base64 인코딩된 bytes
+    """
+    enc_dict:
+        {
+            "(15,'q_proj')" : "<base64 bytes>",
+            "(15,'v_proj')" : "<base64 bytes>"
+        }
+    """
+    enc_dict: dict[str, str]
 
 
 class EncryptedInferenceResponse(BaseModel):
-    # q_proj delta 하나만 받는 구조
-    enc_lora_delta_bytes: str
+    """
+    enc_delta_dict:
+        {
+            "(15,'q_proj')" : "<base64 bytes>",
+            "(15,'v_proj')" : "<base64 bytes>"
+        }
+    """
+    enc_delta_dict: dict[str, str]
 
 
 class ClientBackendRequest(BaseModel):

@@ -6,13 +6,17 @@ import uvicorn
 import tenseal as ts
 from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
-from pydantic import __version__ as pydantic_version
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from common.config import SERVER_HOST, SERVER_PORT, HE_POLY_MODULUS_DEGREE, HIDDEN_SIZE
+from common.config import (
+    SERVER_HOST,
+    SERVER_PORT,
+    HE_POLY_MODULUS_DEGREE,
+    HIDDEN_SIZE,
+)
 from common.he_context import load_server_context
 from common.protocol import (
     EncryptedInferenceRequest,
@@ -20,52 +24,75 @@ from common.protocol import (
     encode_bytes_to_base64,
     decode_base64_to_bytes,
 )
-from server.lora.adapter import get_fhe_lora_tensors
+from server.lora.adapter import get_multi_fhe_lora_tensors
 from server.lora.inference import he_lora_inference
-
-PYDANTIC_V2 = pydantic_version.startswith("2.")
-def model_validate(model_cls, data):
-    return model_cls.model_validate(data) if PYDANTIC_V2 else model_cls.parse_obj(data)
 
 app_state = {}
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[Server] 엔터프라이즈 서버 시작")
+    print("[Server] 엔터프라이즈 FHE-LoRA 서버 시작")
 
+    # 1) CKKS 컨텍스트 로드
     ctx = load_server_context()
-    app_state["he_context"] = ctx
+    app_state["ctx"] = ctx
 
     max_slots = HE_POLY_MODULUS_DEGREE // 2
     if HIDDEN_SIZE > max_slots:
-        print(f"[Server] 경고: HiddenSize={HIDDEN_SIZE}, HE 슬롯={max_slots}")
+        print(f"[Server] 경고: HIDDEN_SIZE={HIDDEN_SIZE}, CKKS slots={max_slots}")
 
-    # q_proj 하나에 대한 LoRA W_A, W_B만 준비
-    W_A_pt, W_B_pt = get_fhe_lora_tensors()
-    app_state["W_A_pt"] = W_A_pt
-    app_state["W_B_pt"] = W_B_pt
+    # 2) (layer, module) 전체에 대한 LoRA 텐서 준비
+    lora_tensors = get_multi_fhe_lora_tensors()
+    app_state["lora_tensors"] = lora_tensors
 
     print("[Server] 준비 완료")
     yield
     print("[Server] 종료")
 
+
 app = FastAPI(lifespan=lifespan)
+
 
 @app.post("/compute_lora", response_model=EncryptedInferenceResponse)
 async def compute_lora(request: EncryptedInferenceRequest):
+    """
+    요청: EncryptedInferenceRequest
+      - enc_dict: {
+            "(15, 'q_proj')": "<base64-ckks>",
+            "(15, 'o_proj')": "<base64-ckks>",
+            ...
+        }
+
+    응답: EncryptedInferenceResponse
+      - enc_delta_dict: {
+            "(15, 'q_proj')": "<base64-ckks-delta>",
+            ...
+        }
+    """
     try:
-        ctx: ts.Context = app_state["he_context"]
-        W_A_pt = app_state["W_A_pt"]
-        W_B_pt = app_state["W_B_pt"]
+        ctx: ts.Context = app_state["ctx"]
+        lora_tensors = app_state["lora_tensors"]
 
-        enc_bytes = decode_base64_to_bytes(request.enc_hidden_state_bytes)
-        enc_vec = ts.ckks_vector_from(ctx, enc_bytes)
+        enc_dict = request.enc_dict
+        out_dict = {}
 
-        # 단일 q_proj LoRA delta만 계산
-        result_bytes = he_lora_inference(enc_vec, W_A_pt, W_B_pt, ctx)
-        resp_b64 = encode_bytes_to_base64(result_bytes)
+        for key_str, enc_b64 in enc_dict.items():
+            # key_str: "(15, 'q_proj')" 형태
+            layer_idx, mod = eval(key_str)  # tuple로 변환
 
-        return EncryptedInferenceResponse(enc_lora_delta_bytes=resp_b64)
+            if (layer_idx, mod) not in lora_tensors:
+                raise KeyError(f"[Server] LoRA tensor 없음: {key_str}")
+
+            W_A_pt, W_B_pt = lora_tensors[(layer_idx, mod)]
+
+            enc_bytes = decode_bytes = decode_base64_to_bytes(enc_b64)
+            enc_vec = ts.ckks_vector_from(ctx, enc_bytes)
+
+            delta_bytes = he_lora_inference(enc_vec, W_A_pt, W_B_pt, ctx)
+            out_dict[key_str] = encode_bytes_to_base64(delta_bytes)
+
+        return EncryptedInferenceResponse(enc_delta_dict=out_dict)
 
     except Exception as e:
         import traceback
