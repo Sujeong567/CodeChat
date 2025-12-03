@@ -20,3 +20,4 @@ def he_lora_inference(enc_input: ts.CKKSVector, W_A_pt, W_B_pt, ctx: ts.Context)
 
     print("[Server] FHE LoRA 연산 완료")
     return enc_logits_lora.serialize()
+
